@@ -1,8 +1,36 @@
 import aiohttp
 import stamina
 import asyncio
+from datetime import datetime
+from typing import Optional, Dict, Any
+from pydantic import BaseModel, Field, validator
 from gcloud.aio.storage import Storage
 from app import settings
+
+
+class FileMetadata(BaseModel):
+    """
+    Pydantic model for Google Cloud Storage file metadata with validation and date parsing.
+    Uses field names that match the Google Cloud Storage API response.
+    """
+    timeCreated: Optional[datetime] = Field(None, description="File creation timestamp")
+    updated: Optional[datetime] = Field(None, description="Last modification timestamp")
+    size: Optional[int] = Field(None, description="File size in bytes")
+    contentType: Optional[str] = Field(None, description="MIME type of the file")
+    md5Hash: Optional[str] = Field(None, description="MD5 hash for integrity checking")
+    etag: Optional[str] = Field(None, description="Entity tag for caching")
+    generation: Optional[str] = Field(None, description="File generation number")
+    metageneration: Optional[str] = Field(None, description="Metadata generation number")
+    storageClass: Optional[str] = Field(None, description="Storage class (STANDARD, NEARLINE, etc.)")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Custom metadata")
+
+    class Config:
+        """Pydantic configuration."""
+        # Allow extra fields that might be present in the response
+        extra = "ignore"
+        # Use enum values instead of enum names
+        use_enum_values = True
+
 
 # ToDo. Move this to the template for other integrations needing file support
 class CloudFileStorage:
@@ -56,13 +84,26 @@ class CloudFileStorage:
                 results = [blob['name'].replace(f"{self.root_prefix}/", "") for blob in items if blob['name'].startswith(f"{self.root_prefix}/")]
                 return results
 
-    async def get_file_metadata(self, integration_id, blob_name):
+    async def get_file_metadata(self, integration_id, blob_name) -> FileMetadata:
+        """
+        Get file metadata from Google Cloud Storage and return as a validated Pydantic model.
+        
+        Args:
+            integration_id: Integration ID (used for path construction)
+            blob_name: Name of the blob/file
+            
+        Returns:
+            FileMetadata: Validated metadata model with parsed dates and types
+        """
         target_path = self.get_file_fullname(integration_id, blob_name)
         for attempt in stamina.retry_context(on=(aiohttp.ClientError, asyncio.TimeoutError),
                                              attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
                 response = await self.storage_client.download_metadata(self.bucket_name, target_path)
-                return response.get('metadata', {})
+                
+                # Create and validate the Pydantic model directly from the response
+                # Field names now match the Google Cloud Storage API response
+                return FileMetadata(**response)
 
     async def update_file_metadata(self, integration_id, blob_name, metadata):
         target_path = self.get_file_fullname(integration_id, blob_name)

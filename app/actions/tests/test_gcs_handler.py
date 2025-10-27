@@ -47,9 +47,10 @@ def test_process_telemetry_file_invalid_json():
 
 
 @pytest.mark.asyncio
+@patch('app.actions.handlers.trigger_action')
 @patch('app.actions.handlers.CloudFileStorage')
 @patch('app.actions.handlers.IntegrationStateManager')
-async def test_action_process_new_files_success(mock_state_manager, mock_file_storage, mock_integration, action_config):
+async def test_action_process_new_files_success(mock_state_manager, mock_file_storage, mock_trigger_action, mock_integration, action_config):
     """Test successful processing of new files"""
     # Mock state manager
     async def mock_get_state(*args, **kwargs):
@@ -101,12 +102,18 @@ async def test_action_process_new_files_success(mock_state_manager, mock_file_st
     mock_file_storage_instance.stream_file = mock_stream_file
     mock_file_storage.return_value = mock_file_storage_instance
     
+    # Mock trigger_action
+    async def mock_trigger_action_func(*args, **kwargs):
+        return None
+    
+    mock_trigger_action.side_effect = mock_trigger_action_func
+    
     # Test the action
     result = await action_process_new_files(mock_integration, action_config)
     
     assert result["status"] == "success"
     assert result["new_files_found"] == 1
-    assert result["files_processed"] == 1
+    assert result["subactions_triggered"] == 1
     assert result["files_archived"] == 0
     assert result["files_deleted"] == 0
 
@@ -723,6 +730,101 @@ async def test_process_csv_file_streaming_large_file():
     for record in result:
         assert "sensor_readings" in record
         assert record["sensor_count"] == 2  # START and SEN_ALL_20Hz
+
+
+@pytest.mark.asyncio
+@patch('app.actions.handlers.log_action_activity')
+@patch('app.actions.handlers.send_observations_to_gundi')
+@patch('app.actions.handlers.CloudFileStorage')
+async def test_action_process_ornitela_file(mock_file_storage, mock_send_observations, mock_log_activity, action_config):
+    """Test the process_ornitela_file action handler"""
+    from app.actions.handlers import action_process_ornitela_file
+    from app.actions.configurations import ProcessOrnitelaFileActionConfiguration
+    
+    # Mock integration
+    mock_integration = Mock()
+    mock_integration.id = "test-integration-id"
+    mock_integration.name = "Test Integration"
+    
+    # Create config for single file processing
+    file_config = ProcessOrnitelaFileActionConfiguration(
+        bucket_name=action_config.bucket_name,
+        bucket_path=action_config.bucket_path,
+        credentials_file=action_config.credentials_file,
+        file_name="test_file.csv",
+        historical_limit_days=30
+    )
+    
+    # Mock CloudFileStorage
+    mock_file_storage_instance = Mock()
+    
+    async def mock_stream_file(*args, **kwargs):
+        # Mock CSV content
+        csv_content = [
+            "device_id,device_name,UTC_datetime,UTC_date,UTC_time,datatype,satcount,U_bat_mV,bat_soc_pct,solar_I_mA,hdop,Latitude,Longitude,MSL_altitude_m,Reserved,speed_km/h,direction_deg,int_temperature_C,mag_x,mag_y,mag_z,acc_x,acc_y,acc_z,UTC_timestamp,milliseconds,light,altimeter_m,depth_m,conductivity_mS/cm,ext_temperature_C\n",
+            "226976,GF_BAR_2022_ADU_W_IMA_Gauele,2025-01-18 09:10:11,2025-01-18,09:10:11,GPSS,3,3702,8,,,44.394531250000000,5.370184421539307,,,,,,,,,,,247,2025-01-18 09:10:11.0,0,,,,,\n"
+        ]
+        for chunk in csv_content:
+            yield chunk.encode('utf-8')
+    
+    mock_file_storage_instance.stream_file = mock_stream_file
+    mock_file_storage.return_value = mock_file_storage_instance
+    
+    # Mock send_observations_to_gundi
+    async def mock_send_func(*args, **kwargs):
+        return {"status": "success"}
+    
+    mock_send_observations.side_effect = mock_send_func
+    
+    # Test the action
+    result = await action_process_ornitela_file(mock_integration, file_config)
+    
+    # Verify results
+    assert result["status"] == "success"
+    assert result["file_name"] == "test_file.csv"
+    assert result["telemetry_records"] > 0
+    assert result["observations_sent"] > 0
+    
+    # Verify send_observations_to_gundi was called
+    mock_send_observations.assert_called()
+
+
+@pytest.mark.asyncio
+@patch('app.actions.handlers.log_action_activity')
+@patch('app.actions.handlers.send_observations_to_gundi')
+@patch('app.actions.handlers.CloudFileStorage')
+async def test_action_process_ornitela_file_skip_non_csv(mock_file_storage, mock_send_observations, mock_log_activity, action_config):
+    """Test that non-CSV files are skipped"""
+    from app.actions.handlers import action_process_ornitela_file
+    from app.actions.configurations import ProcessOrnitelaFileActionConfiguration
+    
+    # Mock integration
+    mock_integration = Mock()
+    mock_integration.id = "test-integration-id"
+    mock_integration.name = "Test Integration"
+    
+    # Create config for non-CSV file
+    file_config = ProcessOrnitelaFileActionConfiguration(
+        bucket_name=action_config.bucket_name,
+        bucket_path=action_config.bucket_path,
+        credentials_file=action_config.credentials_file,
+        file_name="test_file.json",
+        historical_limit_days=30
+    )
+    
+    # Mock CloudFileStorage
+    mock_file_storage.return_value = Mock()
+    
+    # Test the action
+    result = await action_process_ornitela_file(mock_integration, file_config)
+    
+    # Verify file was skipped
+    assert result["status"] == "skipped"
+    assert result["reason"] == "Not a CSV file"
+    assert result["file_name"] == "test_file.json"
+    
+    # Verify send_observations_to_gundi was NOT called
+    mock_send_observations.assert_not_called()
 
 
 @pytest.mark.asyncio

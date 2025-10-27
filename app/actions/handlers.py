@@ -8,6 +8,11 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, AsyncGenerator, Generator
 from app.services.gundi import send_observations_to_gundi
 from app.services.utils import batches_from_generator
+from app.services.activity_logger import activity_logger, log_action_activity
+from app.services.action_scheduler import crontab_schedule, trigger_action
+from gundi_core.schemas.v2.gundi import LogLevel
+
+
 try:
     from google.cloud import storage
     from google.oauth2 import service_account
@@ -49,7 +54,8 @@ except ImportError:
         })
     })()
 
-from app.actions.configurations import ProcessTelemetryDataActionConfiguration
+from app.actions.configurations import ProcessTelemetryDataActionConfiguration, ProcessOrnitelaFileActionConfiguration
+from app.actions.utils import FileProcessingLockManager
 from app.services.state import IntegrationStateManager
 from app.services.file_storage import CloudFileStorage
 
@@ -94,6 +100,197 @@ def _detect_encoding(chunk: bytes) -> str:
     # If all fail, return utf-8 with error replacement
     return 'utf-8'
 
+@activity_logger()
+async def action_process_ornitela_file(integration, action_config: ProcessOrnitelaFileActionConfiguration):
+    """
+    Action handler that processes a single Ornitela telemetry data file.
+    
+    This handler:
+    1. Acquires a processing lock to prevent concurrent processing
+    2. Streams and parses the CSV file
+    3. Transforms the data into Gundi observations
+    4. Sends observations to Gundi in batches
+    5. Archives and deletes files based on configuration
+    6. Releases the processing lock
+    """
+    integration_id = str(integration.id)
+    lock_manager = FileProcessingLockManager()
+    
+    # Try to acquire a lock for this file
+    if not await lock_manager.acquire_lock(integration_id, action_config.file_name):
+        logger.info(f"File {action_config.file_name} is already being processed, skipping")
+        message = f"Skipped file {action_config.file_name} - already being processed"
+        await log_action_activity(
+            integration_id=integration_id,
+            action_id="process_ornitela_file",
+            title=message,
+            level=LogLevel.INFO
+        )
+        return {
+            "status": "skipped",
+            "reason": "File is already being processed",
+            "file_name": action_config.file_name
+        }
+    
+    try:
+        # Initialize CloudFileStorage service
+        file_storage = CloudFileStorage(
+            bucket_name=action_config.bucket_name,
+            root_prefix=action_config.bucket_path
+        )
+        
+        logger.info(f"Processing file {action_config.file_name} for integration {integration_id}")
+        
+        # Skip non-CSV files
+        if not action_config.file_name.endswith('.csv'):
+            logger.info(f"Skipping non-CSV file: {action_config.file_name} (only CSV files are processed)")
+            message = f"Skipped non-CSV file: {action_config.file_name}"
+            await log_action_activity(
+                integration_id=integration_id,
+                action_id="process_ornitela_file",
+                title=message,
+                level=LogLevel.INFO
+            )
+            return {
+                "status": "skipped",
+                "reason": "Not a CSV file",
+                "file_name": action_config.file_name
+            }
+        
+        # Stream CSV file for memory efficiency
+        telemetry_data = await _process_csv_file_streaming(file_storage, integration_id, action_config.file_name)
+        
+        # Transform and send observations
+        transformed_data = generate_gundi_observations(telemetry_data, action_config.historical_limit_days)
+        observations_sent = 0
+        
+        for i, batch in enumerate(batches_from_generator(transformed_data, 200)):
+            logger.info(f'Sending observations batch #{i}: {len(batch)} observations.')
+            await send_observations_to_gundi(observations=batch, integration_id=integration.id)
+            observations_sent += len(batch)
+        
+        # Handle file archiving and deletion after successful processing
+        archive_result = await _handle_file_archiving_and_deletion(
+            file_storage, integration_id, action_config.file_name, 
+            action_config.archive_days, action_config.delete_after_archive_days
+        )
+        
+        message = f"Processed file {action_config.file_name}: extracted {len(telemetry_data)} records, sent {observations_sent} observations"
+        if archive_result["archived"]:
+            message += f", archived file"
+        if archive_result["deleted"]:
+            message += f", deleted archived file"
+            
+        logger.info(message)
+        
+        await log_action_activity(
+            integration_id=integration_id,
+            action_id="process_ornitela_file",
+            title=message,
+            level=LogLevel.INFO
+        )
+        
+        # Release the processing lock
+        await lock_manager.release_lock(integration_id, action_config.file_name)
+        
+        return {
+            "status": "success",
+            "file_name": action_config.file_name,
+            "telemetry_records": len(telemetry_data),
+            "observations_sent": observations_sent,
+            "archived": archive_result["archived"],
+            "deleted": archive_result["deleted"]
+        }
+        
+    except Exception as e:
+        logger.exception(f"Error processing file {action_config.file_name}: {str(e)}")
+        message = f"Error processing file {action_config.file_name}: {str(e)}"
+        await log_action_activity(
+            integration_id=str(integration.id),
+            action_id="process_ornitela_file",
+            title=message,
+            level=LogLevel.ERROR
+        )
+        
+        # Release the processing lock even in case of error
+        await lock_manager.release_lock(integration_id, action_config.file_name)
+        
+        return {
+            "status": "error",
+            "file_name": action_config.file_name,
+            "error": str(e)
+        }
+
+
+async def _handle_file_archiving_and_deletion(file_storage, integration_id: str, file_name: str, 
+                                            archive_days: int, delete_after_archive_days: int) -> Dict[str, bool]:
+    """
+    Handle archiving and deletion of processed files based on configuration.
+    
+    Args:
+        file_storage: CloudFileStorage instance
+        integration_id: Integration ID
+        file_name: Name of the file to process
+        archive_days: Days after processing before archiving
+        delete_after_archive_days: Days after archiving before deletion
+        
+    Returns:
+        Dict with 'archived' and 'deleted' boolean flags
+    """
+    result = {"archived": False, "deleted": False}
+    
+    try:
+        # Get file metadata to check age
+        metadata = await file_storage.get_file_metadata(integration_id, file_name)
+        file_created = metadata.timeCreated or datetime.now(timezone.utc)
+        
+        # Ensure timezone awareness
+        if file_created.tzinfo is None:
+            file_created = file_created.replace(tzinfo=timezone.utc)
+            
+        current_time = datetime.now(timezone.utc)
+        days_since_created = (current_time - file_created).days
+        
+        # Check if file should be archived
+        if days_since_created >= archive_days:
+            try:
+                # Move file to archive folder by copying and then deleting original
+                archive_path = f"archive/{file_name}"
+                
+                # Copy file to archive location
+                import tempfile
+                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                    await file_storage.download_file(integration_id, file_name, temp_file.name)
+                    await file_storage.upload_file(integration_id, temp_file.name, archive_path)
+                
+                # Delete original file
+                await file_storage.delete_file(integration_id, file_name)
+                
+                result["archived"] = True
+                logger.info(f"Archived file: {file_name}")
+                
+            except Exception as e:
+                logger.error(f"Error archiving file {file_name}: {str(e)}")
+        
+        # Check if archived file should be deleted
+        elif days_since_created >= delete_after_archive_days:
+            try:
+                archive_path = f"archive/{file_name}"
+                await file_storage.delete_file(integration_id, archive_path)
+                
+                result["deleted"] = True
+                logger.info(f"Deleted archived file: {file_name}")
+                
+            except Exception as e:
+                logger.error(f"Error deleting archived file {file_name}: {str(e)}")
+                
+    except Exception as e:
+        logger.error(f"Error handling file archiving/deletion for {file_name}: {str(e)}")
+    
+    return result
+
+
+@crontab_schedule("*/10 * * * *")  # Regular schedule.
 async def action_process_new_files(integration, action_config: ProcessTelemetryDataActionConfiguration):
     """
     Action handler that processes new telemetry data files from Google Cloud Storage.
@@ -101,9 +298,8 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
     This handler:
     1. Lists files in the GCS bucket
     2. Identifies new files that haven't been processed
-    3. Processes the telemetry data from new files
-    4. Archives processed files
-    5. Deletes old archived files based on configuration
+    3. Triggers individual file processing actions
+    4. Archives and deletion are handled by the individual file processing actions
     """
     
     state_manager = IntegrationStateManager()
@@ -120,14 +316,11 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
         # Get current state to track processed files
         state = await state_manager.get_state(integration_id, action_id)
         processed_files = set(state.get("processed_files", []))
-        archived_files = set(state.get("archived_files", []))
         
         # List all files in the bucket path
         file_list = await file_storage.list_files(integration_id)
         
         new_files = []
-        files_to_archive = []
-        files_to_delete = []
         
         current_time = datetime.now(timezone.utc)
         
@@ -139,13 +332,9 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
             # Get file metadata
             try:
                 metadata = await file_storage.get_file_metadata(integration_id, file_name)
-                file_modified_str = metadata.get("created", current_time.isoformat())
-                file_modified = datetime.fromisoformat(file_modified_str)
-                # Ensure timezone awareness
-                if file_modified.tzinfo is None:
-                    file_modified = file_modified.replace(tzinfo=timezone.utc)
-                file_size = metadata.get("size", 0)
-                content_type = metadata.get("content_type", "application/octet-stream")
+                file_modified = metadata.updated or current_time
+                file_size = metadata.size or 0
+                content_type = metadata.contentType or "application/octet-stream"
             except Exception as e:
                 logger.warning(f"Could not get metadata for file {file_name}: {str(e)}")
                 file_modified = current_time
@@ -160,88 +349,39 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
                     "created": file_modified.isoformat(),
                     "content_type": content_type
                 })
-            else:
-                # Check if file should be archived
-                if file_name not in archived_files:
-                    days_since_processed = (current_time - file_modified).days
-                    if days_since_processed >= action_config.archive_days:
-                        files_to_archive.append(file_name)
-                
-                # Check if archived file should be deleted
-                if file_name in archived_files:
-                    days_since_archived = (current_time - file_modified).days
-                    if days_since_archived >= action_config.delete_after_archive_days:
-                        files_to_delete.append(file_name)
         
-        # Process new files
-        processed_count = 0
+        # Trigger processing for each new file
+        subactions_triggered = 0
         for file_info in new_files:
             try:
-                # Process telemetry data using streaming for large files
-                if not file_info["name"].endswith('.csv'):
-                    # Skip non-CSV files
-                    logger.info(f"Skipping non-CSV file: {file_info['name']} (only CSV files are processed)")
-                    continue
-
-                # Stream CSV file for memory efficiency
-                telemetry_data = await _process_csv_file_streaming(file_storage, integration_id, file_info["name"])
+                # Trigger the single-file processing action
+                from app.actions.configurations import ProcessOrnitelaFileActionConfiguration
                 
-                transformed_data = generate_gundi_observations(telemetry_data, action_config.historical_limit_days)
-                for i, batch in enumerate(batches_from_generator(transformed_data, 200)):
-                    logger.info(f'Sending observations batch #{i}: {len(batch)} observations.')
-                    response = await send_observations_to_gundi(observations=batch, integration_id=integration.id)
+                config = ProcessOrnitelaFileActionConfiguration(
+                    bucket_name=action_config.bucket_name,
+                    bucket_path=action_config.bucket_path,
+                    credentials_file=action_config.credentials_file,
+                    file_name=file_info["name"],
+                    historical_limit_days=action_config.historical_limit_days,
+                    archive_days=action_config.archive_days,
+                    delete_after_archive_days=action_config.delete_after_archive_days
+                )
                 
-                # Mark file as processed
-                processed_files.add(file_info["name"])
-                processed_count += 1
+                await trigger_action(
+                    integration_id=integration.id,
+                    action_id="process_ornitela_file",  # This is the action ID (without action_ prefix)
+                    config=config
+                )
                 
-                logger.info(f"Processed file: {file_info['name']}, extracted {len(telemetry_data)} records")
+                subactions_triggered += 1
                 
             except Exception as e:
-                logger.exception(f"Error processing file {file_info['name']}: {str(e)}")
+                logger.exception(f"Error triggering action for file {file_info['name']}: {str(e)}")
                 continue
         
-        # Archive files
+        # Archive and delete logic is now handled in the process_ornitela_file action
         archived_count = 0
-        for file_name in files_to_archive:
-            try:
-                # Move file to archive folder by copying and then deleting original
-                archive_path = f"archive/{file_name}"
-                
-                # Copy file to archive location
-                import tempfile
-                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                    await file_storage.download_file(integration_id, file_name, temp_file.name)
-                    await file_storage.upload_file(integration_id, temp_file.name, archive_path)
-                
-                # Delete original file
-                await file_storage.delete_file(integration_id, file_name)
-                
-                archived_files.add(file_name)
-                archived_count += 1
-                
-                logger.info(f"Archived file: {file_name}")
-                
-            except Exception as e:
-                logger.error(f"Error archiving file {file_name}: {str(e)}")
-                continue
-        
-        # Delete old archived files
         deleted_count = 0
-        for file_name in files_to_delete:
-            try:
-                archive_path = f"archive/{file_name}"
-                await file_storage.delete_file(integration_id, archive_path)
-                
-                archived_files.discard(file_name)
-                processed_files.discard(file_name)
-                deleted_count += 1
-                
-                logger.info(f"Deleted archived file: {file_name}")
-                
-            except Exception as e:
-                logger.error(f"Error deleting archived file {file_name}: {str(e)}")
-                continue
         
         # Update state
         await state_manager.set_state(
@@ -249,9 +389,8 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
             action_id, 
             {
                 "processed_files": list(processed_files),
-                "archived_files": list(archived_files),
                 "last_run": current_time.isoformat(),
-                "last_processed_count": processed_count,
+                "last_subactions_triggered": subactions_triggered,
                 "last_archived_count": archived_count,
                 "last_deleted_count": deleted_count
             }
@@ -260,11 +399,10 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
         return {
             "status": "success",
             "new_files_found": len(new_files),
-            "files_processed": processed_count,
+            "subactions_triggered": subactions_triggered,
             "files_archived": archived_count,
             "files_deleted": deleted_count,
-            "total_processed_files": len(processed_files),
-            "total_archived_files": len(archived_files)
+            "total_processed_files": len(processed_files)
         }
         
     except Exception as e:
@@ -367,21 +505,20 @@ async def _process_csv_file_streaming(file_storage, integration_id: str, file_na
             try:
                 row_data = dict(zip(csv_reader.fieldnames, next(csv.reader(io.StringIO(buffer)))))
                 
-                # Skip rows that look like headers (contain field names as values)
-                if row_data.get("datatype") in ["device_id", "device_name", "UTC_datetime", "UTC_date", "UTC_time", "datatype", "satcount", "U_bat_mV", "bat_soc_pct", "solar_I_mA", "hdop", "Latitude", "Longitude", "MSL_altitude_m", "Reserved", "speed_km/h", "direction_deg", "int_temperature_C", "mag_x", "mag_y", "mag_z", "acc_x", "acc_y", "acc_z", "UTC_timestamp", "milliseconds", "light", "altimeter_m", "depth_m", "conductivity_mS/cm", "ext_temperature_C"]:
-                    pass  # Skip this row
-                else:
-                    datatype = row_data.get("datatype", "")
-                    
-                    if datatype in ["GPS", "GPSS"]:
-                        if current_gps_location:
-                            observation = _create_observation(current_gps_location, sensor_readings, file_name)
-                            telemetry_data.append(observation)
-                        current_gps_location = _parse_gps_row(row_data, file_name)
-                    elif datatype.startswith("SEN_"):
-                        if in_sensor_sequence and current_gps_location:
-                            sensor_reading = _parse_sensor_row(row_data)
-                            sensor_readings.append(sensor_reading)
+                datatype = row_data.get("datatype", "")
+                
+                if datatype in ["GPS", "GPSS"]:
+                    if current_gps_location:
+                        observation = _create_observation(current_gps_location, sensor_readings, file_name)
+                        telemetry_data.append(observation)
+                    current_gps_location = _parse_gps_row(row_data, file_name)
+                elif datatype.startswith("SEN_"):
+                    if in_sensor_sequence and current_gps_location:
+                        sensor_reading = _parse_sensor_row(row_data)
+                        sensor_readings.append(sensor_reading)
+                elif datatype.startswith("datatype"):
+                    logger.warning(f"Skipping a header row. Is this a programming error?")
+
             except (ValueError, KeyError) as e:
                 logger.exception(f"Error parsing final CSV row in {file_name}: {str(e)}")
         
