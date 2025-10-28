@@ -48,9 +48,12 @@ services:
       - "5678:5678"
     volumes:
       - ../app:/code/app
+      - ./credentials:/code/credentials:ro  # Mount credentials directory as read-only
     env_file:
       - path: ".env.local"
         required: true
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/code/credentials/gcs-credentials.json  # Path to credentials file
     depends_on:
       redis:
         condition: service_healthy

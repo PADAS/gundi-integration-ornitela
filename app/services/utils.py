@@ -2,7 +2,7 @@ import struct
 import typing
 from pydantic import create_model, BaseModel
 from pydantic.fields import Field, FieldInfo, Undefined, NoArgAnyCallable
-from typing import Any, Dict, Optional, Union, List, Annotated
+from typing import Any, Dict, Optional, Union, List, Annotated, Generator
 
 
 def find_config_for_action(configurations, action_id):
@@ -402,3 +402,16 @@ def generate_batches(iterable, batch_size):
     for i in range(0, len(iterable), batch_size):
         yield iterable[i: i + batch_size]
 
+
+def batches_from_generator(generator:Generator[Any, None, None], batch_size:int) -> Generator[List[Any], None, None]:
+    '''
+    This function takes a generator and yields lists of size batch_size.
+    '''
+    batch = []
+    for item in generator:
+        batch.append(item)
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
