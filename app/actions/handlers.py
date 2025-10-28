@@ -7,10 +7,15 @@ import io
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, AsyncGenerator, Generator
 from app.services.gundi import send_observations_to_gundi
-from app.services.utils import batches_from_generator
+from app.services.utils import batches_from_generator, find_config_for_action
+from app.services.errors import ConfigurationNotFound
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.action_scheduler import crontab_schedule, trigger_action
 from gundi_core.schemas.v2.gundi import LogLevel
+from app.actions.configurations import ProcessTelemetryDataActionConfiguration, ProcessOrnitelaFileActionConfiguration
+from app.actions.utils import FileProcessingLockManager
+from app.services.state import IntegrationStateManager
+from app.services.file_storage import CloudFileStorage
 
 
 try:
@@ -54,11 +59,6 @@ except ImportError:
         })
     })()
 
-from app.actions.configurations import ProcessTelemetryDataActionConfiguration, ProcessOrnitelaFileActionConfiguration
-from app.actions.utils import FileProcessingLockManager
-from app.services.state import IntegrationStateManager
-from app.services.file_storage import CloudFileStorage
-
 logger = logging.getLogger(__name__)
 
 class OrnitelaFileProcessingError(Exception):
@@ -99,6 +99,20 @@ def _detect_encoding(chunk: bytes) -> str:
     
     # If all fail, return utf-8 with error replacement
     return 'utf-8'
+
+def get_file_processing_config(integration):
+
+    file_processing_config = find_config_for_action(
+        configurations=integration.configurations,
+        action_id="process_new_files"
+    )
+    if not file_processing_config:
+        raise ConfigurationNotFound(
+            f"File processing settings for integration {str(integration.id)} "
+            f"are missing. Please fix the integration setup in the portal."
+        )
+    return ProcessTelemetryDataActionConfiguration.parse_obj(file_processing_config.data)
+
 
 @activity_logger()
 async def action_process_ornitela_file(integration, action_config: ProcessOrnitelaFileActionConfiguration):
@@ -151,6 +165,10 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
                 title=message,
                 level=LogLevel.INFO
             )
+            
+            # Release lock
+            await lock_manager.release_lock(integration_id, action_config.file_name)
+            
             return {
                 "status": "skipped",
                 "reason": "Not a CSV file",
@@ -328,6 +346,10 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
             # Skip directories
             if file_name.endswith("/"):
                 continue
+            
+            # Skip files in the archive folder
+            if file_name.startswith("archive/"):
+                continue
                 
             # Get file metadata
             try:
@@ -350,13 +372,11 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
                     "content_type": content_type
                 })
         
-        # Trigger processing for each new file
+        # Trigger processing for each new file individually
         subactions_triggered = 0
         for file_info in new_files:
             try:
                 # Trigger the single-file processing action
-                from app.actions.configurations import ProcessOrnitelaFileActionConfiguration
-                
                 config = ProcessOrnitelaFileActionConfiguration(
                     bucket_name=action_config.bucket_name,
                     bucket_path=action_config.bucket_path,
