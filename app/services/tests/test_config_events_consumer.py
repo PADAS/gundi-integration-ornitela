@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 
-api_client = TestClient(app)
+api_client = TestClient(app=app)
 
 
 @pytest.mark.asyncio

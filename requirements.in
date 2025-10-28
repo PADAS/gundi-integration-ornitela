@@ -1,3 +1,4 @@
 # Add your integration-specific dependencies here
 google-auth>=2.23.0
 gcloud-aio-storage==9.3.0
+httpx==0.24.1

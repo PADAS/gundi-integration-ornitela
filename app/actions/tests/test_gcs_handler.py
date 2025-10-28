@@ -1,9 +1,12 @@
 import pytest
 from unittest.mock import Mock, patch, MagicMock, mock_open
 from datetime import datetime, timedelta, timezone
+import aiohttp
+from aioresponses import aioresponses
 
 from app.actions.configurations import ProcessTelemetryDataActionConfiguration
 from app.actions.handlers import action_process_new_files, _process_telemetry_file, _process_csv_file_streaming
+from app.services.file_storage import FileMetadata
 
 
 @pytest.fixture
@@ -22,6 +25,49 @@ def action_config():
         archive_days=30,
         delete_after_archive_days=90
     )
+
+
+@pytest.fixture
+def mock_aiohttp():
+    """Mock aiohttp calls to prevent real HTTP requests during tests"""
+    with aioresponses() as m:
+        # Mock Google OAuth2 token refresh
+        m.post(
+            "https://oauth2.googleapis.com/token",
+            payload={
+                "access_token": "test-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            },
+            status=200
+        )
+        # Mock Google Pub/Sub API calls
+        m.post(
+            "https://pubsub.googleapis.com/v1/projects/*/topics/*:publish",
+            payload={"messageIds": ["test-message-id"]},
+            status=200
+        )
+        # Mock Google Cloud Storage API calls
+        m.get(
+            "https://storage.googleapis.com/storage/v1/b/*/o/*",
+            payload={
+                "timeCreated": "2024-01-01T00:00:00Z",
+                "updated": "2024-01-01T00:00:00Z",
+                "size": "1024",
+                "contentType": "application/octet-stream"
+            },
+            status=200
+        )
+        m.post(
+            "https://storage.googleapis.com/upload/storage/v1/b/*/o",
+            payload={"name": "test-file"},
+            status=200
+        )
+        m.delete(
+            "https://storage.googleapis.com/storage/v1/b/*/o/*",
+            status=204
+        )
+        yield m
 
 
 def test_process_telemetry_file_json():
@@ -50,7 +96,7 @@ def test_process_telemetry_file_invalid_json():
 @patch('app.actions.handlers.trigger_action')
 @patch('app.actions.handlers.CloudFileStorage')
 @patch('app.actions.handlers.IntegrationStateManager')
-async def test_action_process_new_files_success(mock_state_manager, mock_file_storage, mock_trigger_action, mock_integration, action_config):
+async def test_action_process_new_files_success(mock_state_manager, mock_file_storage, mock_trigger_action, mock_integration, action_config, mock_aiohttp):
     """Test successful processing of new files"""
     # Mock state manager
     async def mock_get_state(*args, **kwargs):
@@ -69,11 +115,12 @@ async def test_action_process_new_files_success(mock_state_manager, mock_file_st
         return ["bird001_20240101.csv"]  # No integration ID in path
     
     async def mock_get_file_metadata(*args, **kwargs):
-        return {
-            "created": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
-            "size": 1024,
-            "content_type": "application/json"
-        }
+        return FileMetadata(
+            timeCreated=datetime.now(timezone.utc) - timedelta(hours=1),
+            updated=datetime.now(timezone.utc) - timedelta(hours=1),
+            size=1024,
+            contentType="application/json"
+        )
     
     async def mock_download_file(*args, **kwargs):
         return None
@@ -121,7 +168,7 @@ async def test_action_process_new_files_success(mock_state_manager, mock_file_st
 @pytest.mark.asyncio
 @patch('app.actions.handlers.CloudFileStorage')
 @patch('app.actions.handlers.IntegrationStateManager')
-async def test_action_process_new_files_with_archiving(mock_state_manager, mock_file_storage, mock_integration, action_config):
+async def test_action_process_new_files_with_archiving(mock_state_manager, mock_file_storage, mock_integration, action_config, mock_aiohttp):
     """Test processing with file archiving"""
     # Mock state with processed files that should be archived
     old_time = datetime.now(timezone.utc) - timedelta(days=35)  # Older than archive_days (30)
@@ -145,11 +192,12 @@ async def test_action_process_new_files_with_archiving(mock_state_manager, mock_
         return ["old_file.json"]  # No integration ID in path
     
     async def mock_get_file_metadata(*args, **kwargs):
-        return {
-            "created": old_time.isoformat(),
-            "size": 1024,
-            "content_type": "application/json"
-        }
+        return FileMetadata(
+            timeCreated=old_time,
+            updated=old_time,
+            size=1024,
+            contentType="application/json"
+        )
     
     async def mock_download_file(*args, **kwargs):
         return None
@@ -172,18 +220,15 @@ async def test_action_process_new_files_with_archiving(mock_state_manager, mock_
     with patch('builtins.open', mock_open(read_data='{"device_id": "bird001", "data": "test"}')):
         result = await action_process_new_files(mock_integration, action_config)
     
-    assert result["status"] == "success"
-    assert result["files_archived"] == 1
-    # Verify upload_file was called for archiving
-    mock_file_storage_instance.upload_file.assert_called_once()
-    # Verify delete was called on original file
-    mock_file_storage_instance.delete_file.assert_called_once()
+        assert result["status"] == "success"
+        # Note: Archiving logic is now handled in the process_ornitela_file action, not here
+        assert result["files_archived"] == 0
 
 
 @pytest.mark.asyncio
 @patch('app.actions.handlers.CloudFileStorage')
 @patch('app.actions.handlers.IntegrationStateManager')
-async def test_action_process_new_files_with_deletion(mock_state_manager, mock_file_storage, mock_integration, action_config):
+async def test_action_process_new_files_with_deletion(mock_state_manager, mock_file_storage, mock_integration, action_config, mock_aiohttp):
     """Test processing with file deletion"""
     # Mock state with archived files that should be deleted
     very_old_time = datetime.now(timezone.utc) - timedelta(days=95)  # Older than delete_after_archive_days (90)
@@ -207,11 +252,12 @@ async def test_action_process_new_files_with_deletion(mock_state_manager, mock_f
         return ["very_old_file.json"]  # No integration ID in path
     
     async def mock_get_file_metadata(*args, **kwargs):
-        return {
-            "created": very_old_time.isoformat(),
-            "size": 1024,
-            "content_type": "application/json"
-        }
+        return FileMetadata(
+            timeCreated=very_old_time,
+            updated=very_old_time,
+            size=1024,
+            contentType="application/json"
+        )
     
     async def mock_download_file(*args, **kwargs):
         return None
@@ -233,9 +279,8 @@ async def test_action_process_new_files_with_deletion(mock_state_manager, mock_f
     result = await action_process_new_files(mock_integration, action_config)
     
     assert result["status"] == "success"
-    assert result["files_deleted"] == 1
-    # Verify delete was called on archived file
-    mock_file_storage_instance.delete_file.assert_called_once()
+    # Note: Deletion logic is now handled in the process_ornitela_file action, not here
+    assert result["files_deleted"] == 0
 
 
 @pytest.mark.asyncio
@@ -733,10 +778,12 @@ async def test_process_csv_file_streaming_large_file():
 
 
 @pytest.mark.asyncio
+@patch('app.services.activity_logger.publish_event')
 @patch('app.actions.handlers.log_action_activity')
 @patch('app.actions.handlers.send_observations_to_gundi')
 @patch('app.actions.handlers.CloudFileStorage')
-async def test_action_process_ornitela_file(mock_file_storage, mock_send_observations, mock_log_activity, action_config):
+@patch('app.actions.handlers.FileProcessingLockManager')
+async def test_action_process_ornitela_file(mock_lock_manager, mock_file_storage, mock_send_observations, mock_log_activity, mock_publish_event, action_config, mock_aiohttp):
     """Test the process_ornitela_file action handler"""
     from app.actions.handlers import action_process_ornitela_file
     from app.actions.configurations import ProcessOrnitelaFileActionConfiguration
@@ -759,25 +806,67 @@ async def test_action_process_ornitela_file(mock_file_storage, mock_send_observa
     mock_file_storage_instance = Mock()
     
     async def mock_stream_file(*args, **kwargs):
-        # Mock CSV content
+        # Mock CSV content with recent date
+        recent_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         csv_content = [
             "device_id,device_name,UTC_datetime,UTC_date,UTC_time,datatype,satcount,U_bat_mV,bat_soc_pct,solar_I_mA,hdop,Latitude,Longitude,MSL_altitude_m,Reserved,speed_km/h,direction_deg,int_temperature_C,mag_x,mag_y,mag_z,acc_x,acc_y,acc_z,UTC_timestamp,milliseconds,light,altimeter_m,depth_m,conductivity_mS/cm,ext_temperature_C\n",
-            "226976,GF_BAR_2022_ADU_W_IMA_Gauele,2025-01-18 09:10:11,2025-01-18,09:10:11,GPSS,3,3702,8,,,44.394531250000000,5.370184421539307,,,,,,,,,,,247,2025-01-18 09:10:11.0,0,,,,,\n"
+            f"226976,GF_BAR_2022_ADU_W_IMA_Gauele,{recent_date},{recent_date.split()[0]},{recent_date.split()[1]},GPSS,3,3702,8,,,44.394531250000000,5.370184421539307,,,,,,,,,,,247,{recent_date}.0,0,,,,,\n"
         ]
         for chunk in csv_content:
             yield chunk.encode('utf-8')
     
+    async def mock_get_file_metadata(*args, **kwargs):
+        return FileMetadata(
+            timeCreated=datetime.now(timezone.utc) - timedelta(hours=1),
+            updated=datetime.now(timezone.utc) - timedelta(hours=1),
+            size=1024,
+            contentType="text/csv"
+        )
+    
+    async def mock_download_file(*args, **kwargs):
+        return None
+    
+    async def mock_upload_file(*args, **kwargs):
+        return None
+    
+    async def mock_delete_file(*args, **kwargs):
+        return None
+    
     mock_file_storage_instance.stream_file = mock_stream_file
+    mock_file_storage_instance.get_file_metadata = mock_get_file_metadata
+    mock_file_storage_instance.download_file = mock_download_file
+    mock_file_storage_instance.upload_file = mock_upload_file
+    mock_file_storage_instance.delete_file = mock_delete_file
     mock_file_storage.return_value = mock_file_storage_instance
     
-    # Mock send_observations_to_gundi
-    async def mock_send_func(*args, **kwargs):
+    # Mock send_observations_to_gundi to prevent HTTP calls
+    async def mock_send_observations_func(*args, **kwargs):
+        print(f"DEBUG: send_observations_to_gundi called with args={args}, kwargs={kwargs}")
         return {"status": "success"}
     
-    mock_send_observations.side_effect = mock_send_func
+    mock_send_observations.side_effect = mock_send_observations_func
+    
+    # Mock FileProcessingLockManager to prevent Redis calls
+    mock_lock_instance = Mock()
+    async def mock_acquire_lock(*args, **kwargs):
+        return True  # Always allow lock acquisition
+    async def mock_release_lock(*args, **kwargs):
+        return True  # Always succeed at releasing
+    mock_lock_instance.acquire_lock = mock_acquire_lock
+    mock_lock_instance.release_lock = mock_release_lock
+    mock_lock_manager.return_value = mock_lock_instance
+    
+    # Mock publish_event to prevent HTTP calls
+    async def mock_publish_event_func(*args, **kwargs):
+        return None
+    
+    mock_publish_event.side_effect = mock_publish_event_func
     
     # Test the action
     result = await action_process_ornitela_file(mock_integration, file_config)
+    
+    # Debug output
+    print(f"DEBUG: result = {result}")
     
     # Verify results
     assert result["status"] == "success"
@@ -790,10 +879,12 @@ async def test_action_process_ornitela_file(mock_file_storage, mock_send_observa
 
 
 @pytest.mark.asyncio
+@patch('app.services.activity_logger.publish_event')
 @patch('app.actions.handlers.log_action_activity')
-@patch('app.actions.handlers.send_observations_to_gundi')
+@patch('app.services.gundi.send_observations_to_gundi')
 @patch('app.actions.handlers.CloudFileStorage')
-async def test_action_process_ornitela_file_skip_non_csv(mock_file_storage, mock_send_observations, mock_log_activity, action_config):
+@patch('app.actions.handlers.FileProcessingLockManager')
+async def test_action_process_ornitela_file_skip_non_csv(mock_lock_manager, mock_file_storage, mock_send_observations, mock_log_activity, mock_publish_event, action_config, mock_aiohttp):
     """Test that non-CSV files are skipped"""
     from app.actions.handlers import action_process_ornitela_file
     from app.actions.configurations import ProcessOrnitelaFileActionConfiguration
@@ -814,6 +905,22 @@ async def test_action_process_ornitela_file_skip_non_csv(mock_file_storage, mock
     
     # Mock CloudFileStorage
     mock_file_storage.return_value = Mock()
+    
+    # Mock FileProcessingLockManager to prevent Redis calls
+    mock_lock_instance = Mock()
+    async def mock_acquire_lock(*args, **kwargs):
+        return True  # Always allow lock acquisition
+    async def mock_release_lock(*args, **kwargs):
+        return True  # Always succeed at releasing
+    mock_lock_instance.acquire_lock = mock_acquire_lock
+    mock_lock_instance.release_lock = mock_release_lock
+    mock_lock_manager.return_value = mock_lock_instance
+    
+    # Mock publish_event to prevent HTTP calls
+    async def mock_publish_event_func(*args, **kwargs):
+        return None
+    
+    mock_publish_event.side_effect = mock_publish_event_func
     
     # Test the action
     result = await action_process_ornitela_file(mock_integration, file_config)

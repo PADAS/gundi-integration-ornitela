@@ -13,7 +13,7 @@ from app.conftest import MockSubActionConfiguration, MockPushActionConfiguration
 from app.main import app
 from app.services.action_scheduler import trigger_action
 
-api_client = TestClient(app)
+api_client = TestClient(app=app)
 
 
 @pytest.mark.asyncio

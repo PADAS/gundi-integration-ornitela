@@ -11,7 +11,7 @@ from app.main import app
 from app.webhooks import GenericJsonTransformConfig
 from app.services.config_manager import IntegrationConfigurationManager
 
-api_client = TestClient(app)
+api_client = TestClient(app=app)
 
 
 @pytest.mark.asyncio

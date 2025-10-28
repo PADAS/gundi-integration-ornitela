@@ -4,7 +4,7 @@ from app.main import app
 from app.services.self_registration import register_integration_in_gundi
 from app.services.action_scheduler import crontab_schedule, CrontabSchedule
 
-api_client = TestClient(app)
+api_client = TestClient(app=app)
 
 
 @pytest.mark.asyncio
