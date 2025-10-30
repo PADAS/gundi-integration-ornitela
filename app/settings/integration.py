@@ -1,5 +1,3 @@
-import logging.config
-import sys
 from environs import Env
 
 env = Env()
