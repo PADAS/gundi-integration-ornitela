@@ -19,9 +19,7 @@ def mock_integration():
 @pytest.fixture
 def action_config():
     return ProcessTelemetryDataActionConfiguration(
-        bucket_name="test-bucket",
         bucket_path="telemetry-data",
-        credentials_file="/path/to/credentials.json",
         archive_days=30,
         delete_after_archive_days=90
     )
@@ -795,9 +793,7 @@ async def test_action_process_ornitela_file(mock_lock_manager, mock_file_storage
     
     # Create config for single file processing
     file_config = ProcessOrnitelaFileActionConfiguration(
-        bucket_name=action_config.bucket_name,
         bucket_path=action_config.bucket_path,
-        credentials_file=action_config.credentials_file,
         file_name="test_file.csv",
         historical_limit_days=30
     )
@@ -896,9 +892,7 @@ async def test_action_process_ornitela_file_skip_non_csv(mock_lock_manager, mock
     
     # Create config for non-CSV file
     file_config = ProcessOrnitelaFileActionConfiguration(
-        bucket_name=action_config.bucket_name,
         bucket_path=action_config.bucket_path,
-        credentials_file=action_config.credentials_file,
         file_name="test_file.json",
         historical_limit_days=30
     )

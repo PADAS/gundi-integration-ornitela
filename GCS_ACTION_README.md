@@ -6,9 +6,7 @@ This action runner processes telemetry data files uploaded to a Google Cloud Sto
 
 The action uses the `PullActionConfiguration` class with the following parameters:
 
-- **bucket_name** (required): Name of the Google Cloud Storage bucket
 - **bucket_path** (optional): Path within the bucket where telemetry files are stored (default: "")
-- **credentials_file** (required): Path to the Google Cloud service account credentials JSON file
 - **archive_days** (optional): Number of days after processing before files are archived (default: 30)
 - **delete_after_archive_days** (optional): Number of days after archiving before files are deleted (default: 90)
 
@@ -168,9 +166,7 @@ The action maintains state in Redis to track:
 ```python
 # Configuration example
 config = PullActionConfiguration(
-    bucket_name="bird-telemetry-bucket",
     bucket_path="raw-data/2024",
-    credentials_file="/path/to/service-account.json",
     archive_days=30,
     delete_after_archive_days=90
 )
