@@ -16,6 +16,7 @@ from app.actions.configurations import ProcessTelemetryDataActionConfiguration, 
 from app.actions.utils import FileProcessingLockManager
 from app.services.state import IntegrationStateManager
 from app.services.file_storage import CloudFileStorage
+from app import settings
 
 
 try:
@@ -149,7 +150,7 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
     try:
         # Initialize CloudFileStorage service
         file_storage = CloudFileStorage(
-            bucket_name=action_config.bucket_name,
+            bucket_name=settings.INFILE_STORAGE_BUCKET,
             root_prefix=action_config.bucket_path
         )
         
@@ -327,7 +328,7 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
     try:
         # Initialize CloudFileStorage service
         file_storage = CloudFileStorage(
-            bucket_name=action_config.bucket_name,
+            bucket_name=settings.INFILE_STORAGE_BUCKET,
             root_prefix=action_config.bucket_path
         )
         
@@ -378,9 +379,7 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
             try:
                 # Trigger the single-file processing action
                 config = ProcessOrnitelaFileActionConfiguration(
-                    bucket_name=action_config.bucket_name,
                     bucket_path=action_config.bucket_path,
-                    credentials_file=action_config.credentials_file,
                     file_name=file_info["name"],
                     historical_limit_days=action_config.historical_limit_days,
                     archive_days=action_config.archive_days,
