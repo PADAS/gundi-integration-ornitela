@@ -677,8 +677,10 @@ def generate_gundi_observations(
             gps_timestamp = datetime.strptime(observation["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         except Exception:
             # If timestamp parsing fails, skip this observation
+            logger.warning(f"Could not parse timestamp for observation: {observation['observation_id']} Device: {observation['device_id']}")
             continue
         if gps_timestamp < cutoff_time:
+            logger.info(f"Skipping observation: {observation['observation_id']}({observation['timestamp']}) - older than cutoff date {cutoff_time.isoformat()}")
             continue
 
         temps = []
@@ -691,18 +693,6 @@ def generate_gundi_observations(
         millis = []
 
         for sensor_reading in observation.get("sensor_readings", []):
-            # Compute precise sensor timestamp and filter by cutoff
-            try:
-                sensor_reading_timestamp = datetime.strptime(sensor_reading.get("timestamp", ""), "%Y-%m-%d %H:%M:%S")
-                sensor_reading_ms = int(sensor_reading.get("additional", {}).get("milliseconds") or 0)
-                precise_timestamp = sensor_reading_timestamp + timedelta(milliseconds=sensor_reading_ms)
-                precise_timestamp = precise_timestamp.replace(tzinfo=timezone.utc)
-            except Exception:
-                # If sensor timestamp invalid, skip this sample
-                continue
-            if precise_timestamp < cutoff_time:
-                continue
-
             env = sensor_reading.get("environmental", {})
             sensors = sensor_reading.get("sensors", {})
             mag = sensors.get("magnetometer", {})
@@ -715,7 +705,7 @@ def generate_gundi_observations(
             acc_x.append(acc.get("x"))
             acc_y.append(acc.get("y"))
             acc_z.append(acc.get("z"))
-            millis.append(sensor_reading_ms)
+            millis.append(int(sensor_reading.get("additional", {}).get("milliseconds") or 0))
 
         sample_count = len(temps)
 

@@ -341,9 +341,9 @@ async def test_process_csv_file_streaming():
     assert sensor_reading["datatype"] == "SEN_ALL_20Hz_START"
     assert sensor_reading["timestamp"] == "2025-01-18 09:10:12"
     
-    sensor_reading2 = observation["sensor_readings"][1]
-    assert sensor_reading2["datatype"] == "SEN_ALL_20Hz"
-    assert sensor_reading2["timestamp"] == "2025-01-18 09:10:13"
+    sensor_reading1 = observation["sensor_readings"][1]
+    assert sensor_reading1["datatype"] == "SEN_ALL_20Hz"
+    assert sensor_reading1["timestamp"] == "2025-01-18 09:10:13"
 
     sensor_reading2 = observation["sensor_readings"][2]
     assert sensor_reading2["datatype"] == "SEN_ALL_20Hz_END"
@@ -678,6 +678,7 @@ async def test_generate_gundi_observations_historical_limit():
             "file": "old_data.csv",
             "timestamp": old_time.strftime("%Y-%m-%d %H:%M:%S"),
             "device_id": "226976",
+            "observation_id": "226976_old",
             "device_name": "Old Device",
             "location": {"lat": 44.0, "lon": 5.0, "altitude": None},
             "movement": {"speed": None, "direction": None},
