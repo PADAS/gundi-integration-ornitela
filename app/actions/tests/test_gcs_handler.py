@@ -333,8 +333,8 @@ async def test_process_csv_file_streaming():
     
     # Check sensor readings
     assert "sensor_readings" in observation
-    assert observation["sensor_count"] == 2  # SEN_ALL_20Hz_START and SEN_ALL_20Hz
-    assert len(observation["sensor_readings"]) == 2
+    assert observation["sensor_count"] == 3  # SEN_ALL_20Hz_START, SEN_ALL_20Hz and SEN_ALL_20Hz_END
+    assert len(observation["sensor_readings"]) == 3
     
     # Check sensor reading structure
     sensor_reading = observation["sensor_readings"][0]
@@ -344,6 +344,10 @@ async def test_process_csv_file_streaming():
     sensor_reading2 = observation["sensor_readings"][1]
     assert sensor_reading2["datatype"] == "SEN_ALL_20Hz"
     assert sensor_reading2["timestamp"] == "2025-01-18 09:10:13"
+
+    sensor_reading2 = observation["sensor_readings"][2]
+    assert sensor_reading2["datatype"] == "SEN_ALL_20Hz_END"
+    assert sensor_reading2["timestamp"] == "2025-01-18 09:10:14"
 
 
 @pytest.mark.asyncio
@@ -454,10 +458,10 @@ async def test_generate_gundi_observations():
     # Generate individual observations (convert generator to list for testing)
     result = list(generate_gundi_observations(grouped_observations, historical_limit_days=30))
     
-    # Should have 3 observations (1 GPS + 2 sensor readings)
-    assert len(result) == 3
+    # Should have 1 "grouped" observation (with condensed sensor data)
+    assert len(result) == 1
     
-    # Check GPS-only observation (first)
+    # Check GPS info
     gps_observation = result[0]
     assert "recorded_at" in gps_observation
     assert gps_observation["location"]["lat"] == 44.394531250000000
@@ -465,24 +469,18 @@ async def test_generate_gundi_observations():
     assert gps_observation["source_name"] == "GF_BAR_2022_ADU_W_IMA_Gauele"
     assert gps_observation["type"] == "tracking-device"
     
-    # Check first sensor observation
-    sensor_observation1 = result[1]
-    assert "recorded_at" in sensor_observation1  # Should have recorded_at field
-    assert sensor_observation1["location"]["lat"] == 44.394531250000000  # GPS location applied
-    assert sensor_observation1["source"] == "226976"
-    assert sensor_observation1["source_name"] == "GF_BAR_2022_ADU_W_IMA_Gauele"
-    assert sensor_observation1["type"] == "tracking-device"
+    # Check GPS additional info
+    assert gps_observation["additional"]["gps"]["battery_mV"] == 3702.0
+    assert gps_observation["additional"]["gps"]["battery_pct"] == 8.0
     
-    # Check second sensor observation
-    sensor_observation2 = result[2]
-    assert "recorded_at" in sensor_observation2  # Should have recorded_at field
-    assert sensor_observation2["location"]["lat"] == 44.394531250000000  # GPS location applied
-    assert sensor_observation2["source"] == "226976"
-    assert sensor_observation2["source_name"] == "GF_BAR_2022_ADU_W_IMA_Gauele"
-    assert sensor_observation2["type"] == "tracking-device"
+    # Check sensors additional info
+    assert gps_observation["additional"]["sensors"]["temperature_C"] == [25.5, 25.6]
+    assert gps_observation["additional"]["sensors"]["millis"] == [100, 200]
+
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip("This test is currently skipped due to changes in observations generation.")
 async def test_generate_gundi_observations_individual_sensor_readings():
     """Test that individual observations are created for each sensor reading"""
     from app.actions.handlers import generate_gundi_observations
@@ -723,15 +721,15 @@ async def test_generate_gundi_observations_historical_limit():
     # Test with 30-day limit - should only include recent observations
     result_30_days = list(generate_gundi_observations(grouped_observations, historical_limit_days=30))
     
-    # Should have 2 observations (1 GPS + 1 sensor) from recent data only
-    assert len(result_30_days) == 2
+    # Should have 1 "grouped" observation from recent data only
+    assert len(result_30_days) == 1
     assert all(obs["source"] == "226977" for obs in result_30_days)  # Only recent device
     
     # Test with 40-day limit - should include both old and recent observations
     result_40_days = list(generate_gundi_observations(grouped_observations, historical_limit_days=40))
     
-    # Should have 4 observations (2 GPS + 2 sensor) from both devices
-    assert len(result_40_days) == 4
+    # Should have 2 "grouped" observations from both devices
+    assert len(result_40_days) == 2
     sources = [obs["source"] for obs in result_40_days]
     assert "226976" in sources  # Old device
     assert "226977" in sources  # Recent device
@@ -772,7 +770,7 @@ async def test_process_csv_file_streaming_large_file():
     # Check that each observation has sensor readings
     for record in result:
         assert "sensor_readings" in record
-        assert record["sensor_count"] == 2  # START and SEN_ALL_20Hz
+        assert record["sensor_count"] == 3  # START, SEN_ALL_20Hz and END
 
 
 @pytest.mark.asyncio

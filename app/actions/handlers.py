@@ -505,6 +505,9 @@ async def _process_csv_file_streaming(file_storage, integration_id: str, file_na
                                 in_sensor_sequence = True
                                 sensor_readings = []
                             elif datatype.endswith("_END"):
+                                # Add this last sensor reading and end sequence
+                                sensor_reading = _parse_sensor_row(row_data)
+                                sensor_readings.append(sensor_reading)
                                 in_sensor_sequence = False
                             
                             if in_sensor_sequence and current_gps_location:
@@ -652,86 +655,108 @@ def _create_observation(gps_location: Dict[str, Any], sensor_readings: List[Dict
     }
 
 
-def generate_gundi_observations(telemetry_data: List[Dict[str, Any]], historical_limit_days: int = 30) -> Generator[Dict[str, Any], None, None]:
+def generate_gundi_observations(
+        telemetry_data: List[Dict[str, Any]],
+        historical_limit_days: int = 30
+) -> Generator[Dict[str, Any], None, None]:
     """
-    Transform grouped observations into individual observations for each sensor record.
-    
-    This generator function takes observations that have GPS location + sensor readings grouped together
-    and yields individual observations for each sensor record, with the GPS location applied
-    to each sensor observation. This saves memory by yielding observations one at a time.
-    
+    Aggregate grouped observations into one JSON per GPS location where sensor readings
+    are returned as arrays.
+
     Args:
         telemetry_data: List of grouped observations with GPS location and sensor readings
         historical_limit_days: Maximum age of observations to include (in days)
         
     Yields:
-        Individual observations - one GPS observation + one per sensor reading
+        One "grouped" observation with GPS observation + all sensor readings
     """
     current_time = datetime.now(timezone.utc)
     cutoff_time = current_time - timedelta(days=historical_limit_days)
     for observation in telemetry_data:
-
-        recorded_at = datetime.strptime(observation["timestamp"], "%Y-%m-%d %H:%M:%S")
-        recorded_at = recorded_at.replace(tzinfo=timezone.utc)
-
-        # Skip observations older than historical_limit_days
-        if recorded_at < cutoff_time:
+        try:
+            gps_timestamp = datetime.strptime(observation["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except Exception:
+            # If timestamp parsing fails, skip this observation
+            continue
+        if gps_timestamp < cutoff_time:
             continue
 
-        additional = {
-            "datatype": observation["additional"].get("datatype", ""),
-            "movement": observation.get("movement", {}),
-            "device_status": observation.get("device_status", {}),
-            "sensors": observation.get("sensors", {}),
-            "environmental": observation.get("environmental", {}),
+        temps = []
+        mag_x = []
+        mag_y = []
+        mag_z = []
+        acc_x = []
+        acc_y = []
+        acc_z = []
+        millis = []
+
+        for sensor_reading in observation.get("sensor_readings", []):
+            # Compute precise sensor timestamp and filter by cutoff
+            try:
+                sensor_reading_timestamp = datetime.strptime(sensor_reading.get("timestamp", ""), "%Y-%m-%d %H:%M:%S")
+                sensor_reading_ms = int(sensor_reading.get("additional", {}).get("milliseconds") or 0)
+                precise_timestamp = sensor_reading_timestamp + timedelta(milliseconds=sensor_reading_ms)
+                precise_timestamp = precise_timestamp.replace(tzinfo=timezone.utc)
+            except Exception:
+                # If sensor timestamp invalid, skip this sample
+                continue
+            if precise_timestamp < cutoff_time:
+                continue
+
+            env = sensor_reading.get("environmental", {})
+            sensors = sensor_reading.get("sensors", {})
+            mag = sensors.get("magnetometer", {})
+            acc = sensors.get("accelerometer", {})
+
+            temps.append(env.get("temperature"))
+            mag_x.append(mag.get("x"))
+            mag_y.append(mag.get("y"))
+            mag_z.append(mag.get("z"))
+            acc_x.append(acc.get("x"))
+            acc_y.append(acc.get("y"))
+            acc_z.append(acc.get("z"))
+            millis.append(sensor_reading_ms)
+
+        sample_count = len(temps)
+
+        gps_info = {
+            "hdop": observation.get("device_status", {}).get("hdop"),
+            "speed_kmh": observation.get("movement", {}).get("speed"),
+            "direction_deg": observation.get("movement", {}).get("direction"),
+            "battery_mV": observation.get("device_status", {}).get("battery_voltage"),
+            "battery_pct": observation.get("device_status", {}).get("battery_soc"),
+            "solar_mA": observation.get("device_status", {}).get("solar_current"),
         }
-        # Always create a GPS-only observation first
+
+        recorded_at = gps_timestamp.isoformat()
         gundi_observation = {
             "file": observation["file"],
             # "observation_id": f"{observation['device_id']}_{observation['timestamp'].replace(' ', '_').replace(':', '-')}",
-            "recorded_at": recorded_at.isoformat(),
+            "recorded_at": recorded_at,
             "source": observation["device_id"],
             "source_name": observation["device_name"],
             'subject_type': 'unassigned',
             "type": "tracking-device",
-            "additional": additional,
-            "location": observation["location"],
+            "location": {
+                "lon": observation.get("location", {}).get("lon"),
+                "lat": observation.get("location", {}).get("lat")
+            },
+            "additional": {
+                "gps": gps_info,
+                "sensors": {
+                    "temperature_C": temps,
+                    "mag_x": mag_x,
+                    "mag_y": mag_y,
+                    "mag_z": mag_z,
+                    "acc_x": acc_x,
+                    "acc_y": acc_y,
+                    "acc_z": acc_z,
+                    "millis": millis
+                },
+                "sample_count": sample_count
+            }
         }
         yield gundi_observation
-        
-        # Create one observation per sensor reading record
-        for sensor_reading in observation.get("sensor_readings", []):
-            
-            # Calculate recorded_at by adding milliseconds to timestamp
-            sensor_timestamp = datetime.strptime(sensor_reading["timestamp"], "%Y-%m-%d %H:%M:%S")
-            milliseconds = sensor_reading.get("additional", {}).get("milliseconds", 0)
-            recorded_at = sensor_timestamp + timedelta(milliseconds=milliseconds)
-            recorded_at = recorded_at.replace(tzinfo=timezone.utc)
-
-            # Skip sensor observations older than historical_limit_days
-            if recorded_at < cutoff_time:
-                continue
-            
-            additional = {
-                "datatype": sensor_reading["additional"].get("datatype", ""),
-                "movement": sensor_reading.get("movement", {}),
-                "device_status": sensor_reading.get("device_status", {}),
-                "sensors": sensor_reading.get("sensors", {}),
-                "environmental": sensor_reading.get("environmental", {}),
-            }
-            
-            sensor_observation = {
-                "file": observation["file"],
-                # "observation_id": f"{observation['device_id']}_{sensor_reading['timestamp'].replace(' ', '_').replace(':', '-')}_{milliseconds}",
-                "recorded_at": recorded_at.isoformat(),  # Precise timestamp with milliseconds
-                "source": observation["device_id"],
-                "source_name": observation["device_name"],
-                'subject_type': 'unassigned',
-                "type": "tracking-device",
-                "location": observation["location"],  # Apply GPS location 
-                "additional": additional,    
-            }
-            yield sensor_observation
 
 
 def _process_telemetry_file(content: str, file_name: str) -> List[Dict[str, Any]]:
