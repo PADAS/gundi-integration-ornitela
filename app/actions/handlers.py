@@ -177,7 +177,12 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
             }
         
         # Stream CSV file for memory efficiency
-        telemetry_data = await _process_csv_file_streaming(file_storage, integration_id, action_config.file_name)
+        telemetry_data = await _process_csv_file_streaming(
+            file_storage,
+            integration_id,
+            action_config.file_name,
+            action_config.include_sensor_readings
+        )
         
         # Transform and send observations
         transformed_data = generate_gundi_observations(telemetry_data, action_config.historical_limit_days)
@@ -383,7 +388,8 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
                     file_name=file_info["name"],
                     historical_limit_days=action_config.historical_limit_days,
                     archive_days=action_config.archive_days,
-                    delete_after_archive_days=action_config.delete_after_archive_days
+                    delete_after_archive_days=action_config.delete_after_archive_days,
+                    include_sensor_readings=action_config.include_sensor_readings
                 )
                 
                 await trigger_action(
@@ -432,7 +438,12 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
         }
 
 
-async def _process_csv_file_streaming(file_storage, integration_id: str, file_name: str) -> List[Dict[str, Any]]:
+async def _process_csv_file_streaming(
+        file_storage,
+        integration_id: str,
+        file_name: str,
+        include_sensor_readings: bool
+) -> List[Dict[str, Any]]:
     """
     Process CSV telemetry data using streaming for memory efficiency.
     This handles both SMS and GPRS files, grouping sensor data with GPS locations.
@@ -499,7 +510,7 @@ async def _process_csv_file_streaming(file_storage, integration_id: str, file_na
                             sensor_readings = []
                             in_sensor_sequence = False
                             
-                        elif datatype.startswith("SEN_"):
+                        elif datatype.startswith("SEN_") and include_sensor_readings:
                             # Sensor data - add to current readings
                             if datatype.endswith("_START"):
                                 in_sensor_sequence = True
@@ -534,7 +545,7 @@ async def _process_csv_file_streaming(file_storage, integration_id: str, file_na
                         observation = _create_observation(current_gps_location, sensor_readings, file_name)
                         telemetry_data.append(observation)
                     current_gps_location = _parse_gps_row(row_data, file_name)
-                elif datatype.startswith("SEN_"):
+                elif datatype.startswith("SEN_") and include_sensor_readings:
                     if in_sensor_sequence and current_gps_location:
                         sensor_reading = _parse_sensor_row(row_data)
                         sensor_readings.append(sensor_reading)
@@ -683,32 +694,6 @@ def generate_gundi_observations(
             logger.info(f"Skipping observation: {observation['observation_id']}({observation['timestamp']}) - older than cutoff date {cutoff_time.isoformat()}")
             continue
 
-        temps = []
-        mag_x = []
-        mag_y = []
-        mag_z = []
-        acc_x = []
-        acc_y = []
-        acc_z = []
-        millis = []
-
-        for sensor_reading in observation.get("sensor_readings", []):
-            env = sensor_reading.get("environmental", {})
-            sensors = sensor_reading.get("sensors", {})
-            mag = sensors.get("magnetometer", {})
-            acc = sensors.get("accelerometer", {})
-
-            temps.append(env.get("temperature"))
-            mag_x.append(mag.get("x"))
-            mag_y.append(mag.get("y"))
-            mag_z.append(mag.get("z"))
-            acc_x.append(acc.get("x"))
-            acc_y.append(acc.get("y"))
-            acc_z.append(acc.get("z"))
-            millis.append(int(sensor_reading.get("additional", {}).get("milliseconds") or 0))
-
-        sample_count = len(temps)
-
         gps_info = {
             "hdop": observation.get("device_status", {}).get("hdop"),
             "speed_kmh": observation.get("movement", {}).get("speed"),
@@ -732,20 +717,49 @@ def generate_gundi_observations(
                 "lat": observation.get("location", {}).get("lat")
             },
             "additional": {
-                "gps": gps_info,
-                "sensors": {
-                    "temperature_C": temps,
-                    "mag_x": mag_x,
-                    "mag_y": mag_y,
-                    "mag_z": mag_z,
-                    "acc_x": acc_x,
-                    "acc_y": acc_y,
-                    "acc_z": acc_z,
-                    "millis": millis
-                },
-                "sample_count": sample_count
+                "gps": gps_info
             }
         }
+
+        sensor_readings = observation.get("sensor_readings", [])
+
+        if sensor_readings:
+            temps = []
+            mag_x = []
+            mag_y = []
+            mag_z = []
+            acc_x = []
+            acc_y = []
+            acc_z = []
+            millis = []
+
+            for sensor_reading in sensor_readings:
+                env = sensor_reading.get("environmental", {})
+                sensors = sensor_reading.get("sensors", {})
+                mag = sensors.get("magnetometer", {})
+                acc = sensors.get("accelerometer", {})
+
+                temps.append(env.get("temperature"))
+                mag_x.append(mag.get("x"))
+                mag_y.append(mag.get("y"))
+                mag_z.append(mag.get("z"))
+                acc_x.append(acc.get("x"))
+                acc_y.append(acc.get("y"))
+                acc_z.append(acc.get("z"))
+                millis.append(int(sensor_reading.get("additional", {}).get("milliseconds") or 0))
+
+            sample_count = len(temps)
+            gundi_observation["additional"]["sensors"] = {
+                "temperature_C": temps,
+                "mag_x": mag_x,
+                "mag_y": mag_y,
+                "mag_z": mag_z,
+                "acc_x": acc_x,
+                "acc_y": acc_y,
+                "acc_z": acc_z,
+                "millis": millis
+            }
+            gundi_observation["additional"]["sample_count"] = sample_count
         yield gundi_observation
 
 

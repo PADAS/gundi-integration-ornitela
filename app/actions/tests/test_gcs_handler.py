@@ -294,7 +294,8 @@ async def test_action_process_new_files_credentials_error(mock_file_storage, moc
 
 
 @pytest.mark.asyncio
-async def test_process_csv_file_streaming():
+@pytest.mark.parametrize("include_sensor_readings", [True, False])
+async def test_process_csv_file_streaming_with_and_without_sensor_readings(include_sensor_readings):
     """Test streaming CSV file processing"""
     # Mock file storage
     mock_file_storage = Mock()
@@ -314,7 +315,12 @@ async def test_process_csv_file_streaming():
     
     mock_file_storage.stream_file = mock_stream_file
     
-    result = await _process_csv_file_streaming(mock_file_storage, "test-integration", "test_data.csv")
+    result = await _process_csv_file_streaming(
+        mock_file_storage,
+        "test-integration",
+        "test_data.csv",
+        include_sensor_readings
+    )
     
     # Should have 1 observation (GPS + sensor readings grouped together)
     assert len(result) == 1
@@ -332,22 +338,28 @@ async def test_process_csv_file_streaming():
     assert observation["additional"]["datatype"] == "GPSS"
     
     # Check sensor readings
-    assert "sensor_readings" in observation
-    assert observation["sensor_count"] == 3  # SEN_ALL_20Hz_START, SEN_ALL_20Hz and SEN_ALL_20Hz_END
-    assert len(observation["sensor_readings"]) == 3
-    
-    # Check sensor reading structure
-    sensor_reading = observation["sensor_readings"][0]
-    assert sensor_reading["datatype"] == "SEN_ALL_20Hz_START"
-    assert sensor_reading["timestamp"] == "2025-01-18 09:10:12"
-    
-    sensor_reading1 = observation["sensor_readings"][1]
-    assert sensor_reading1["datatype"] == "SEN_ALL_20Hz"
-    assert sensor_reading1["timestamp"] == "2025-01-18 09:10:13"
+    if include_sensor_readings:
+        # Expect the grouped sensor sequence to be present
+        assert "sensor_readings" in observation
+        assert observation["sensor_count"] == 3  # START, SEN_ALL_20Hz and END
+        assert len(observation["sensor_readings"]) == 3
 
-    sensor_reading2 = observation["sensor_readings"][2]
-    assert sensor_reading2["datatype"] == "SEN_ALL_20Hz_END"
-    assert sensor_reading2["timestamp"] == "2025-01-18 09:10:14"
+        # Check sensor reading structure and datatypes
+        sensor_reading = observation["sensor_readings"][0]
+        assert sensor_reading["datatype"] == "SEN_ALL_20Hz_START"
+        assert sensor_reading["timestamp"] == "2025-01-18 09:10:12"
+
+        sensor_reading1 = observation["sensor_readings"][1]
+        assert sensor_reading1["datatype"] == "SEN_ALL_20Hz"
+        assert sensor_reading1["timestamp"] == "2025-01-18 09:10:13"
+
+        sensor_reading2 = observation["sensor_readings"][2]
+        assert sensor_reading2["datatype"] == "SEN_ALL_20Hz_END"
+        assert sensor_reading2["timestamp"] == "2025-01-18 09:10:14"
+    else:
+        # When sensor readings are excluded, expect none attached
+        assert observation.get("sensor_readings", []) == []
+        assert observation.get("sensor_count", 0) == 0
 
 
 @pytest.mark.asyncio
@@ -369,7 +381,12 @@ async def test_process_csv_file_streaming_gps_only():
     
     mock_file_storage.stream_file = mock_stream_file
     
-    result = await _process_csv_file_streaming(mock_file_storage, "test-integration", "test_data.csv")
+    result = await _process_csv_file_streaming(
+        mock_file_storage,
+        "test-integration",
+        "test_data.csv",
+        True
+    )
     
     # Should have 2 observations (2 GPS records)
     assert len(result) == 2
@@ -760,7 +777,12 @@ async def test_process_csv_file_streaming_large_file():
     
     mock_file_storage.stream_file = mock_stream_file
     
-    result = await _process_csv_file_streaming(mock_file_storage, "test-integration", "large_data.csv")
+    result = await _process_csv_file_streaming(
+        mock_file_storage,
+        "test-integration",
+        "large_data.csv",
+        True
+    )
     
     # Should have 1000 observations (GPS + sensor data grouped)
     assert len(result) == 1000
@@ -961,7 +983,12 @@ async def test_process_csv_file_streaming_encoding_handling():
     
     mock_file_storage.stream_file = mock_stream_file
     
-    result = await _process_csv_file_streaming(mock_file_storage, "test-integration", "problematic_data.csv")
+    result = await _process_csv_file_streaming(
+        mock_file_storage,
+        "test-integration",
+        "problematic_data.csv",
+        True
+    )
     
     # Should have processed the data successfully despite encoding issues
     assert len(result) == 1

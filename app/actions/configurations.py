@@ -8,6 +8,7 @@ class ProcessTelemetryDataActionConfiguration(PullActionConfiguration, Executabl
     archive_days: int = pydantic.Field(30, title="Archive Days", description="Number of days after processing before files are archived")
     delete_after_archive_days: int = pydantic.Field(90, title="Delete After Archive Days", description="Number of days after archiving before files are deleted")
     historical_limit_days: int = pydantic.Field(30, title="Historical Limit Days", description="Number of days to look back for data")
+    include_sensor_readings: bool = pydantic.Field(True, title="Include Sensor Readings", description="Whether to include sensor readings in observations processing")
     
     @pydantic.validator("bucket_path")
     def validate_bucket_path(cls, v):
@@ -20,6 +21,7 @@ class ProcessOrnitelaFileActionConfiguration(InternalActionConfiguration):
     historical_limit_days: int = pydantic.Field(30, title="Historical Limit Days", description="Number of days to look back for data")
     archive_days: int = pydantic.Field(30, title="Archive Days", description="Number of days after processing before files are archived")
     delete_after_archive_days: int = pydantic.Field(90, title="Delete After Archive Days", description="Number of days after archiving before files are deleted")
+    include_sensor_readings: bool = pydantic.Field(True, title="Include Sensor Readings", description="Whether to include sensor readings in observations processing")
     
     @pydantic.validator("bucket_path")
     def validate_bucket_path(cls, v):
