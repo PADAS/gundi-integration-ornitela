@@ -260,7 +260,7 @@ async def test_process_ornitela_file_error_handling(
 
 @pytest.mark.asyncio
 async def test_process_csv_file_streaming_gps_and_sensors():
-    """GPS row with a sensor burst should produce 1 grouped observation."""
+    """GPS row and sensor rows should each become separate observations."""
     mock_storage = Mock()
 
     async def mock_stream(*a, **kw):
@@ -271,16 +271,23 @@ async def test_process_csv_file_streaming_gps_and_sensors():
 
     result = await _process_csv_file_streaming(mock_storage, "test-integration", "test.csv")
 
-    assert len(result) == 1
-    obs = result[0]
-    assert obs["device_id"] == "226976"
-    assert obs["timestamp"] == "2025-01-18 09:10:11"
-    assert obs["location"]["lat"] == 44.394531250000000
-    assert obs["location"]["lon"] == 5.370184421539307
-    assert obs["device_status"]["battery_voltage"] == 3702.0
-    assert obs["sensor_count"] == 2  # SEN_START and SEN_ROW
-    assert obs["sensor_readings"][0]["datatype"] == "SEN_ALL_20Hz_START"
-    assert obs["sensor_readings"][1]["datatype"] == "SEN_ALL_20Hz"
+    # 1 GPS + 3 sensor rows (SEN_START, SEN_ROW, SEN_END)
+    assert len(result) == 4
+
+    gps_obs = result[0]
+    assert gps_obs["device_id"] == "226976"
+    assert gps_obs["timestamp"] == "2025-01-18 09:10:11"
+    assert gps_obs["location"]["lat"] == 44.394531250000000
+    assert gps_obs["location"]["lon"] == 5.370184421539307
+    assert gps_obs["device_status"]["battery_voltage"] == 3702.0
+    assert gps_obs["sensor_count"] == 0
+
+    sensor_obs = result[1]
+    assert sensor_obs["additional"]["datatype"] == "SEN_ALL_20Hz_START"
+    assert sensor_obs["location"] == {"lat": 0, "lon": 0, "altitude": None}
+
+    assert result[2]["additional"]["datatype"] == "SEN_ALL_20Hz"
+    assert result[3]["additional"]["datatype"] == "SEN_ALL_20Hz_END"
 
 
 @pytest.mark.asyncio
@@ -338,43 +345,38 @@ def test_generate_gundi_observations_yields_gps_observation():
 
 
 def test_generate_gundi_observations_yields_sensor_observations():
-    """Each sensor reading must produce a separate observation."""
+    """Sensor observations in telemetry data must be yielded with location (0, 0)."""
     now = datetime.now(timezone.utc)
-    telemetry = [
-        {
+
+    def make_obs(datatype, location, ms=0):
+        return {
             "file": "test.csv",
-            "observation_id": "226976_ts",
+            "observation_id": f"226976_{datatype}",
             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
             "device_id": "226976",
             "device_name": "TestBird",
-            "location": {"lat": 44.39, "lon": 5.37, "altitude": None},
+            "location": location,
             "movement": {},
             "device_status": {},
-            "sensor_readings": [
-                {
-                    "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-                    "datatype": "SEN_ALL_20Hz",
-                    "environmental": {},
-                    "sensors": {},
-                    "additional": {"datatype": "SEN_ALL_20Hz", "utc_date": "", "utc_time": "", "utc_timestamp": "", "milliseconds": 50},
-                },
-                {
-                    "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-                    "datatype": "SEN_ALL_20Hz",
-                    "environmental": {},
-                    "sensors": {},
-                    "additional": {"datatype": "SEN_ALL_20Hz", "utc_date": "", "utc_time": "", "utc_timestamp": "", "milliseconds": 100},
-                },
-            ],
-            "sensor_count": 2,
+            "sensor_readings": [],
+            "sensor_count": 0,
             "sensors": {},
-            "additional": {"datatype": "GPSS", "utc_date": "", "utc_time": "", "utc_timestamp": "", "milliseconds": 0},
+            "environmental": {},
+            "additional": {"datatype": datatype, "utc_date": "", "utc_time": "", "utc_timestamp": "", "milliseconds": ms},
         }
+
+    telemetry = [
+        make_obs("GPSS", {"lat": 44.39, "lon": 5.37, "altitude": None}),
+        make_obs("SEN_ALL_20Hz", {"lat": 0, "lon": 0, "altitude": None}, ms=50),
+        make_obs("SEN_ALL_20Hz", {"lat": 0, "lon": 0, "altitude": None}, ms=100),
     ]
 
     results = list(generate_gundi_observations(telemetry, historical_limit_days=30))
 
-    assert len(results) == 3  # 1 GPS + 2 sensor
+    assert len(results) == 3
+    assert results[0]["location"]["lat"] == 44.39  # GPS keeps real location
+    assert results[1]["location"] == {"lat": 0, "lon": 0, "altitude": None}
+    assert results[2]["location"] == {"lat": 0, "lon": 0, "altitude": None}
 
 
 def test_generate_gundi_observations_filters_old_records():

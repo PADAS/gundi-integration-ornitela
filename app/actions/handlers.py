@@ -310,22 +310,17 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
 async def _process_csv_file_streaming(file_storage, integration_id: str, file_name: str) -> List[Dict[str, Any]]:
     """
     Process CSV telemetry data using streaming for memory efficiency.
-    This handles both SMS and GPRS files, grouping sensor data with GPS locations.
+    Each GPS row becomes one observation with its real location.
+    Each SEN_ row becomes one observation with location (0, 0).
     """
     telemetry_data = []
     buffer = ""
     csv_reader = None
     detected_encoding = None
-    
-    # Track current GPS location and sensor readings
-    current_gps_location = None
-    sensor_readings = []
-    in_sensor_sequence = False
-    
+
     try:
         # Stream the file content
         async for chunk in file_storage.stream_file(integration_id, file_name):
-            # Detect encoding on first chunk if not already detected
             if detected_encoding is None:
                 detected_encoding = _detect_encoding(chunk)
                 logger.debug(f"Detected encoding '{detected_encoding}' for file {file_name}")
@@ -338,89 +333,52 @@ async def _process_csv_file_streaming(file_storage, integration_id: str, file_na
             except Exception as e:
                 logger.exception(f"Error decoding chunk in {file_name}: {str(e)}")
                 continue
-            
+
             # Process complete lines
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
-                
+
                 if csv_reader is None:
-                    # Initialize CSV reader with the first line (header)
                     csv_reader = csv.DictReader(io.StringIO(line + '\n'))
                     continue
-                
-                # Process data row
-                if line.strip():  # Skip empty lines
-                    try:
 
-                        if line.startswith("device_id"):
-                            # Skip rows that look like headers (contain field names as values)
-                            continue
+                if not line.strip() or line.startswith("device_id"):
+                    continue
 
-                        # Parse CSV row using the same fieldnames as the header
-                        row_data = dict(zip(csv_reader.fieldnames, next(csv.reader(io.StringIO(line)))))
-                            
-                        datatype = row_data.get("datatype", "")
-                        
-                        # Handle different data types
-                        if datatype in ["GPS", "GPSS"]:
-                            # GPS location data - create new observation
-                            if current_gps_location:
-                                # Create observation with GPS location and any sensor data
-                                observation = _create_observation(current_gps_location, sensor_readings, file_name)
-                                telemetry_data.append(observation)
-                            
-                            # Start new GPS location
-                            current_gps_location = _parse_gps_row(row_data, file_name)
-                            sensor_readings = []
-                            in_sensor_sequence = False
-                            
-                        elif datatype.startswith("SEN_"):
-                            # Sensor data - add to current readings
-                            if datatype.endswith("_START"):
-                                in_sensor_sequence = True
-                                sensor_readings = []
-                            elif datatype.endswith("_END"):
-                                in_sensor_sequence = False
-                            
-                            if in_sensor_sequence and current_gps_location:
-                                sensor_reading = _parse_sensor_row(row_data)
-                                sensor_readings.append(sensor_reading)
-                        
-                        # Optional: Process in batches to avoid memory issues
-                        if len(telemetry_data) % 1000 == 0:
-                            logger.debug(f"Processed {len(telemetry_data)} observations from {file_name}")
-                            
-                    except (ValueError, KeyError) as e:
-                        logger.exception(f"Error parsing CSV row in {file_name}: {str(e)}")
-                        continue
-        
+                try:
+                    row_data = dict(zip(csv_reader.fieldnames, next(csv.reader(io.StringIO(line)))))
+                    datatype = row_data.get("datatype", "")
+
+                    if datatype in ["GPS", "GPSS"]:
+                        observation = _create_observation(_parse_gps_row(row_data, file_name), [], file_name)
+                        telemetry_data.append(observation)
+                    elif datatype.startswith("SEN_"):
+                        telemetry_data.append(_parse_sensor_row_as_observation(row_data, file_name))
+
+                    if len(telemetry_data) % 1000 == 0:
+                        logger.debug(f"Processed {len(telemetry_data)} observations from {file_name}")
+
+                except (ValueError, KeyError) as e:
+                    logger.exception(f"Error parsing CSV row in {file_name}: {str(e)}")
+                    continue
+
         # Process any remaining data in buffer
         if buffer.strip() and csv_reader is not None:
             try:
                 row_data = dict(zip(csv_reader.fieldnames, next(csv.reader(io.StringIO(buffer)))))
-                
                 datatype = row_data.get("datatype", "")
-                
+
                 if datatype in ["GPS", "GPSS"]:
-                    if current_gps_location:
-                        observation = _create_observation(current_gps_location, sensor_readings, file_name)
-                        telemetry_data.append(observation)
-                    current_gps_location = _parse_gps_row(row_data, file_name)
+                    observation = _create_observation(_parse_gps_row(row_data, file_name), [], file_name)
+                    telemetry_data.append(observation)
                 elif datatype.startswith("SEN_"):
-                    if in_sensor_sequence and current_gps_location:
-                        sensor_reading = _parse_sensor_row(row_data)
-                        sensor_readings.append(sensor_reading)
+                    telemetry_data.append(_parse_sensor_row_as_observation(row_data, file_name))
                 elif datatype.startswith("datatype"):
                     logger.warning(f"Skipping a header row. Is this a programming error?")
 
             except (ValueError, KeyError) as e:
                 logger.exception(f"Error parsing final CSV row in {file_name}: {str(e)}")
-        
-        # Create final observation if we have GPS location (with or without sensor data)
-        if current_gps_location:
-            observation = _create_observation(current_gps_location, sensor_readings, file_name)
-            telemetry_data.append(observation)
-        
+
         logger.info(f"Streamed and processed {len(telemetry_data)} observations from CSV file {file_name}")
         return telemetry_data
         
@@ -509,6 +467,32 @@ def _parse_sensor_row(row_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _parse_sensor_row_as_observation(row_data: Dict[str, Any], file_name: str) -> Dict[str, Any]:
+    """Parse a sensor row into a standalone observation with location (0, 0)."""
+    sensor = _parse_sensor_row(row_data)
+    return {
+        "file": file_name,
+        "observation_id": f"{row_data.get('device_id', '')}_{row_data.get('UTC_datetime', '').replace(' ', '_').replace(':', '-')}",
+        "timestamp": row_data.get("UTC_datetime", ""),
+        "device_id": row_data.get("device_id", ""),
+        "device_name": row_data.get("device_name", ""),
+        "location": {"lat": 0, "lon": 0, "altitude": None},
+        "movement": {},
+        "device_status": {},
+        "sensor_readings": [],
+        "sensor_count": 0,
+        "sensors": sensor["sensors"],
+        "environmental": sensor["environmental"],
+        "additional": {
+            "datatype": row_data.get("datatype", ""),
+            "utc_date": row_data.get("UTC_date", ""),
+            "utc_time": row_data.get("UTC_time", ""),
+            "utc_timestamp": row_data.get("UTC_timestamp", ""),
+            "milliseconds": _safe_int(row_data.get("milliseconds")),
+        },
+    }
+
+
 def _create_observation(gps_location: Dict[str, Any], sensor_readings: List[Dict[str, Any]], file_name: str) -> Dict[str, Any]:
     """Create a single observation combining GPS location with sensor readings."""
     return {
@@ -547,9 +531,10 @@ def generate_gundi_observations(telemetry_data: List[Dict[str, Any]], historical
     for observation in telemetry_data:
 
         recorded_at = datetime.strptime(observation["timestamp"], "%Y-%m-%d %H:%M:%S")
+        milliseconds = observation.get("additional", {}).get("milliseconds") or 0
+        recorded_at = recorded_at + timedelta(milliseconds=milliseconds)
         recorded_at = recorded_at.replace(tzinfo=timezone.utc)
 
-        # Skip observations older than historical_limit_days
         if recorded_at < cutoff_time:
             continue
 
@@ -560,53 +545,16 @@ def generate_gundi_observations(telemetry_data: List[Dict[str, Any]], historical
             "sensors": observation.get("sensors", {}),
             "environmental": observation.get("environmental", {}),
         }
-        # Always create a GPS-only observation first
-        gundi_observation = {
+        yield {
             "file": observation["file"],
-            # "observation_id": f"{observation['device_id']}_{observation['timestamp'].replace(' ', '_').replace(':', '-')}",
             "recorded_at": recorded_at.isoformat(),
             "source": observation["device_id"],
             "source_name": observation["device_name"],
-            'subject_type': 'unassigned',
+            "subject_type": "unassigned",
             "type": "tracking-device",
-            "additional": additional,
             "location": observation["location"],
+            "additional": additional,
         }
-        yield gundi_observation
-        
-        # Create one observation per sensor reading record
-        for sensor_reading in observation.get("sensor_readings", []):
-            
-            # Calculate recorded_at by adding milliseconds to timestamp
-            sensor_timestamp = datetime.strptime(sensor_reading["timestamp"], "%Y-%m-%d %H:%M:%S")
-            milliseconds = sensor_reading.get("additional", {}).get("milliseconds", 0)
-            recorded_at = sensor_timestamp + timedelta(milliseconds=milliseconds)
-            recorded_at = recorded_at.replace(tzinfo=timezone.utc)
-
-            # Skip sensor observations older than historical_limit_days
-            if recorded_at < cutoff_time:
-                continue
-            
-            additional = {
-                "datatype": sensor_reading["additional"].get("datatype", ""),
-                "movement": sensor_reading.get("movement", {}),
-                "device_status": sensor_reading.get("device_status", {}),
-                "sensors": sensor_reading.get("sensors", {}),
-                "environmental": sensor_reading.get("environmental", {}),
-            }
-            
-            sensor_observation = {
-                "file": observation["file"],
-                # "observation_id": f"{observation['device_id']}_{sensor_reading['timestamp'].replace(' ', '_').replace(':', '-')}_{milliseconds}",
-                "recorded_at": recorded_at.isoformat(),  # Precise timestamp with milliseconds
-                "source": observation["device_id"],
-                "source_name": observation["device_name"],
-                'subject_type': 'unassigned',
-                "type": "tracking-device",
-                "location": observation["location"],  # Apply GPS location 
-                "additional": additional,    
-            }
-            yield sensor_observation
 
 
 def _process_telemetry_file(content: str, file_name: str) -> List[Dict[str, Any]]:
