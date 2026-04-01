@@ -467,12 +467,26 @@ def _parse_sensor_row(row_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _make_observation_id(row_data: Dict[str, Any]) -> str:
+    base = (
+        f"{row_data.get('device_id', '')}_"
+        f"{(row_data.get('UTC_datetime') or '').replace(' ', '_').replace(':', '-')}"
+    )
+    ms = row_data.get("milliseconds")
+    try:
+        if ms not in (None, ""):
+            return f"{base}-{int(ms):03d}"
+    except (ValueError, TypeError):
+        pass
+    return base
+
+
 def _parse_sensor_row_as_observation(row_data: Dict[str, Any], file_name: str) -> Dict[str, Any]:
     """Parse a sensor row into a standalone observation with location (0, 0)."""
     sensor = _parse_sensor_row(row_data)
     return {
         "file": file_name,
-        "observation_id": f"{row_data.get('device_id', '')}_{row_data.get('UTC_datetime', '').replace(' ', '_').replace(':', '-')}",
+        "observation_id": _make_observation_id(row_data),
         "timestamp": row_data.get("UTC_datetime", ""),
         "device_id": row_data.get("device_id", ""),
         "device_name": row_data.get("device_name", ""),
@@ -515,16 +529,17 @@ def generate_gundi_observations(telemetry_data: List[Dict[str, Any]], historical
     """
     Transform grouped observations into individual observations for each sensor record.
     
-    This generator function takes observations that have GPS location + sensor readings grouped together
-    and yields individual observations for each sensor record, with the GPS location applied
-    to each sensor observation. This saves memory by yielding observations one at a time.
-    
+    Filters and transforms parsed telemetry rows into Gundi observation dicts.
+    GPS rows carry their real location; sensor rows carry location (0, 0).
+    Rows older than historical_limit_days are skipped.
+    Millisecond offsets from the additional field are applied to recorded_at.
+
     Args:
-        telemetry_data: List of grouped observations with GPS location and sensor readings
+        telemetry_data: List of observations produced by _process_csv_file_streaming
         historical_limit_days: Maximum age of observations to include (in days)
-        
+
     Yields:
-        Individual observations - one GPS observation + one per sensor reading
+        One Gundi observation dict per input row
     """
     current_time = datetime.now(timezone.utc)
     cutoff_time = current_time - timedelta(days=historical_limit_days)
