@@ -6,6 +6,7 @@ import csv
 import io
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, AsyncGenerator, Generator, Optional
+from uuid import uuid4
 from app.services.gundi import send_observations_to_gundi, _get_sensors_api_client
 from app.services.utils import batches_from_generator, find_config_for_action
 from app.services.errors import ConfigurationNotFound
@@ -126,7 +127,8 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
     integration_id = str(integration.id)
     file_storage = None
     in_progress_path = f"in_progress/{action_config.file_name}"
-    tag = f"[{action_config.file_name}]"
+    chain_id = action_config.chain_id
+    tag = f"[{action_config.file_name}][chain={chain_id}]" if chain_id else f"[{action_config.file_name}]"
 
     try:
         file_storage = CloudFileStorage(
@@ -294,6 +296,7 @@ async def _trigger_next_chunk(file_storage, integration_id: str, action_config: 
             bucket_path=action_config.bucket_path,
             file_name=chunk_name,
             source_file=source_file,
+            chain_id=action_config.chain_id,
             chunk_size=action_config.chunk_size,
             historical_limit_days=action_config.historical_limit_days,
             delete_after_archive_days=action_config.delete_after_archive_days,
@@ -410,6 +413,7 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
                     bucket_path=action_config.bucket_path,
                     file_name=chunk_name,
                     source_file=file_name,
+                    chain_id=str(uuid4())[:8],
                     chunk_size=action_config.chunk_size,
                     historical_limit_days=action_config.historical_limit_days,
                     delete_after_archive_days=action_config.delete_after_archive_days,
