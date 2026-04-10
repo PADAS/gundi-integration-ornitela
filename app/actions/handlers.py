@@ -6,6 +6,7 @@ import csv
 import io
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, AsyncGenerator, Generator, Optional
+from uuid import uuid4
 from app.services.gundi import send_observations_to_gundi, _get_sensors_api_client
 from app.services.utils import batches_from_generator, find_config_for_action
 from app.services.errors import ConfigurationNotFound
@@ -15,6 +16,7 @@ from gundi_core.schemas.v2.gundi import LogLevel
 from app.actions.configurations import ProcessTelemetryDataActionConfiguration, ProcessOrnitelaFileActionConfiguration
 from app.services.state import IntegrationStateManager
 from app.services.file_storage import CloudFileStorage
+from app.actions.utils import FileProcessingLockManager
 from app import settings
 
 
@@ -125,7 +127,8 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
     integration_id = str(integration.id)
     file_storage = None
     in_progress_path = f"in_progress/{action_config.file_name}"
-    tag = f"[{action_config.file_name}]"
+    chain_id = action_config.chain_id
+    tag = f"[{action_config.file_name}][chain={chain_id}]" if chain_id else f"[{action_config.file_name}]"
 
     try:
         file_storage = CloudFileStorage(
@@ -139,12 +142,10 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
 
         transformed_data = list(generate_gundi_observations(telemetry_data, action_config.historical_limit_days))
         all_batches = list(batches_from_generator(iter(transformed_data), action_config.batch_size))
-        total_batches = len(all_batches)
         observations_sent = 0
         sensors_client = await _get_sensors_api_client(integration_id=str(integration.id))
 
-        for i, batch in enumerate(all_batches):
-            logger.info(f"{tag} Sending batch {i + 1} of {total_batches}")
+        for batch in all_batches:
             await send_observations_to_gundi(observations=batch, sensors_api_client=sensors_client, integration_id=integration.id)
             observations_sent += len(batch)
 
@@ -152,6 +153,9 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
         archive_path = f"archive/{action_config.file_name}"
         await file_storage.move_file(integration_id, in_progress_path, archive_path)
         logger.info(f"{tag} Archived successfully")
+
+        if action_config.source_file:
+            await _trigger_next_chunk(file_storage, integration_id, action_config, integration)
 
         message = f"{tag} Processed: extracted {len(telemetry_data)} records, sent {observations_sent} observations"
         logger.info(message)
@@ -175,7 +179,7 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
         await log_action_activity(
             integration_id=integration_id,
             action_id="process_ornitela_file",
-            title=f"{tag} Processing exceeded the 10-minute limit and was sent to the dead letter queue.",
+            title=f"{tag} Processing exceeded the {settings.MAX_ACTION_EXECUTION_TIME // 60}-minute limit and was sent to the dead letter queue.",
             level=LogLevel.ERROR
         )
         raise
@@ -243,10 +247,10 @@ async def _create_chunk(file_storage, integration_id: str, file_name: str, chunk
         csv.writer(remaining_buffer).writerows([header] + remaining_rows)
         remaining_bytes = remaining_buffer.getvalue().encode('utf-8')
         await file_storage.upload_bytes(integration_id, file_name, remaining_bytes)
-        logger.info(f"File {file_name}: chunk of {len(chunk_rows)} rows created, {len(remaining_rows)} rows remaining")
+        logger.info(f"Chunk created: {chunk_name} ({len(chunk_rows)} rows), {len(remaining_rows)} rows remaining in {file_name}")
     else:
         await file_storage.delete_file(integration_id, file_name)
-        logger.info(f"File {file_name}: final chunk of {len(chunk_rows)} rows, root file deleted")
+        logger.info(f"Chunk created: {chunk_name} ({len(chunk_rows)} rows), root file {file_name} deleted")
 
     return chunk_name
 
@@ -255,13 +259,62 @@ async def _move_to_dead_letter(file_storage, integration_id: str, in_progress_pa
     """Move a file from in_progress/ to dead_letter/ after a processing failure."""
     if file_storage is None:
         return
+    logger.error(f"Attempting to move {file_name} to dead_letter/")
     try:
         dead_letter_path = f"dead_letter/{file_name}"
         await file_storage.move_file(integration_id, in_progress_path, dead_letter_path)
-        logger.error(f"Moved to dead_letter/: {file_name}")
+        logger.error(f"Successfully moved {file_name} to dead_letter/")
     except Exception:
         logger.exception(f"Could not move {file_name} to dead_letter/ — file remains in in_progress/")
 
+
+
+async def _trigger_next_chunk(file_storage, integration_id: str, action_config: ProcessOrnitelaFileActionConfiguration, integration) -> None:
+    """
+    After successfully archiving a chunk, immediately carve and trigger the next chunk
+    from the same source file, bypassing the 5-minute cron wait.
+    If the source file is locked (cron beat us to it) or exhausted, exits silently.
+    """
+    source_file = action_config.source_file
+    lock_manager = FileProcessingLockManager()
+
+    acquired = await lock_manager.acquire_lock(integration_id, source_file)
+    if not acquired:
+        logger.info(f"Source file {source_file} is locked — cron will handle the next chunk")
+        return
+
+    try:
+        chunk_name = await _create_chunk(
+            file_storage, integration_id, source_file, action_config.chunk_size
+        )
+        if chunk_name is None:
+            logger.info(f"Source file {source_file} exhausted, chain complete")
+            return
+
+        config = ProcessOrnitelaFileActionConfiguration(
+            bucket_path=action_config.bucket_path,
+            file_name=chunk_name,
+            source_file=source_file,
+            chain_id=action_config.chain_id,
+            chunk_size=action_config.chunk_size,
+            historical_limit_days=action_config.historical_limit_days,
+            delete_after_archive_days=action_config.delete_after_archive_days,
+            batch_size=action_config.batch_size,
+            include_sensor_data=action_config.include_sensor_data,
+        )
+        await trigger_action(
+            integration_id=integration.id,
+            action_id="process_ornitela_file",
+            config=config,
+        )
+        logger.info(f"Next chunk triggered for {source_file}: {chunk_name}")
+    except Exception as e:
+        if getattr(e, "status", None) == 404:
+            logger.info(f"Source file {source_file} no longer exists — chain complete")
+        else:
+            logger.exception(f"Error triggering next chunk for {source_file}: {str(e)}")
+    finally:
+        await lock_manager.release_lock(integration_id, source_file)
 
 
 @crontab_schedule("*/5 * * * *")  # Regular schedule.
@@ -341,10 +394,16 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
         max_files = action_config.max_files_per_run
         logger.info(f"Found {len(new_files)} new files, processing {min(len(new_files), max_files)}")
         subactions_triggered = 0
+        lock_manager = FileProcessingLockManager()
         for file_info in new_files[:max_files]:
+            file_name = file_info["name"]
+            acquired = await lock_manager.acquire_lock(integration_id, file_name)
+            if not acquired:
+                logger.info(f"File {file_name} is locked by another process, skipping")
+                continue
             try:
                 chunk_name = await _create_chunk(
-                    file_storage, integration_id, file_info["name"], action_config.chunk_size
+                    file_storage, integration_id, file_name, action_config.chunk_size
                 )
                 if chunk_name is None:
                     continue
@@ -352,6 +411,9 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
                 config = ProcessOrnitelaFileActionConfiguration(
                     bucket_path=action_config.bucket_path,
                     file_name=chunk_name,
+                    source_file=file_name,
+                    chain_id=str(uuid4())[:8],
+                    chunk_size=action_config.chunk_size,
                     historical_limit_days=action_config.historical_limit_days,
                     delete_after_archive_days=action_config.delete_after_archive_days,
                     batch_size=action_config.batch_size,
@@ -363,12 +425,12 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
                     action_id="process_ornitela_file",
                     config=config
                 )
-
+                logger.info(f"Sub-action triggered for chunk: {chunk_name}")
                 subactions_triggered += 1
-
             except Exception as e:
-                logger.exception(f"Error triggering action for file {file_info['name']}: {str(e)}")
-                continue
+                logger.exception(f"Error triggering action for file {file_name}: {str(e)}")
+            finally:
+                await lock_manager.release_lock(integration_id, file_name)
 
         # Delete old archived files
         deleted_count = 0
