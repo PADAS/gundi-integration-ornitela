@@ -142,11 +142,10 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
 
         transformed_data = list(generate_gundi_observations(telemetry_data, action_config.historical_limit_days))
         all_batches = list(batches_from_generator(iter(transformed_data), action_config.batch_size))
-        total_batches = len(all_batches)
         observations_sent = 0
         sensors_client = await _get_sensors_api_client(integration_id=str(integration.id))
 
-        for i, batch in enumerate(all_batches):
+        for batch in all_batches:
             await send_observations_to_gundi(observations=batch, sensors_api_client=sensors_client, integration_id=integration.id)
             observations_sent += len(batch)
 
