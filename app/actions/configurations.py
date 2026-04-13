@@ -3,32 +3,43 @@ from .core import ExecutableActionMixin, PullActionConfiguration, InternalAction
 import pydantic
 
 
-class ProcessTelemetryDataActionConfiguration(PullActionConfiguration, ExecutableActionMixin):
-    bucket_path: str = pydantic.Field("ornitela/", title="Bucket Path", description="Path within the bucket where telemetry files are stored")
-    delete_after_archive_days: int = pydantic.Field(5, title="Delete After Archive Days", description="Number of days after archiving before files are deleted")
-    historical_limit_days: int = pydantic.Field(5, title="Historical Limit Days", description="Number of days to look back for data")
-    max_files_per_run: int = pydantic.Field(5, title="Max Files Per Run", description="Maximum number of files to process per run")
-    process_most_recent_first: bool = pydantic.Field(True, title="Process Most Recent First", description="Process the most recently modified files first")
-    chunk_size: int = pydantic.Field(4000, title="Chunk Size", description="Number of rows per processing chunk")
-    batch_size: int = pydantic.Field(500, title="Batch Size", description="Number of observations per batch when sending to Gundi")
-    include_sensor_data: bool = pydantic.Field(True, title="Include Sensor Data", description="Include sensor (SEN_*) rows as observations. Disable to send only GPS position data.")
-
-    @pydantic.validator("bucket_path")
+class BucketPathMixin:
+    @pydantic.validator("bucket_path", pre=True, always=True)
     def validate_bucket_path(cls, v):
         return v.strip().strip('/') if v else ""
 
 
-class ProcessOrnitelaFileActionConfiguration(InternalActionConfiguration):
+class ProcessTelemetryDataActionConfiguration(BucketPathMixin, PullActionConfiguration, ExecutableActionMixin):
+    bucket_path: str = pydantic.Field("ornitela/", title="Bucket Path", description="Path within the bucket where telemetry files are stored")
+    historical_limit_days: int = pydantic.Field(5, title="Historical Limit Days", description="Number of days to look back for data")
+    max_files_per_run: int = pydantic.Field(5, title="Max Files Per Run", description="Maximum number of files to process per run")
+    process_most_recent_first: bool = pydantic.Field(True, title="Process Most Recent First", description="Process the most recently modified files first")
+    chunk_size: int = pydantic.Field(3000, title="Chunk Size", description="Number of rows per processing chunk")
+    batch_size: int = pydantic.Field(300, title="Batch Size", description="Number of observations per batch when sending to Gundi")
+    include_sensor_data: bool = pydantic.Field(True, title="Include Sensor Data", description="Include sensor (SEN_*) rows as observations. Disable to send only GPS position data.")
+
+    @classmethod
+    def ui_schema(cls, *args, **kwargs):
+        schema = super().ui_schema(*args, **kwargs)
+        schema["ui:order"] = ["bucket_path", "process_most_recent_first", "include_sensor_data", "*"]
+        return schema
+
+
+class CleanupArchiveActionConfiguration(BucketPathMixin, ExecutableActionMixin, PullActionConfiguration):
+    bucket_path: str = pydantic.Field("ornitela/", title="Bucket Path", description="Path within the bucket where telemetry files are stored")
+    delete_after_archive_days: int = pydantic.Field(0, title="Delete After Archive Days", description="Number of days after archiving before files are deleted")
+
+
+class ProcessOrnitelaFileActionConfiguration(BucketPathMixin, InternalActionConfiguration):
     bucket_path: str = pydantic.Field("", title="Bucket Path", description="Path within the bucket where telemetry files are stored")
     file_name: str = pydantic.Field(..., title="File Name", description="Name of the file to process")
     source_file: Optional[str] = pydantic.Field(None, title="Source File", description="Original root file this chunk was carved from; when set, triggers the next chunk after archiving")
     chain_id: Optional[str] = pydantic.Field(None, title="Chain ID", description="UUID identifying the chain of chunks carved from the same source file")
+    chunk_index: int = pydantic.Field(1, title="Chunk Index", description="Sequential index of this chunk within the chain")
     chunk_size: int = pydantic.Field(4000, title="Chunk Size", description="Number of rows per processing chunk")
     historical_limit_days: int = pydantic.Field(5, title="Historical Limit Days", description="Number of days to look back for data")
-    delete_after_archive_days: int = pydantic.Field(5, title="Delete After Archive Days", description="Number of days after archiving before files are deleted")
     batch_size: int = pydantic.Field(500, title="Batch Size", description="Number of observations per batch when sending to Gundi")
     include_sensor_data: bool = pydantic.Field(True, title="Include Sensor Data", description="Include sensor (SEN_*) rows as observations. Disable to send only GPS position data.")
 
-    @pydantic.validator("bucket_path")
-    def validate_bucket_path(cls, v):
-        return v.strip().strip('/') if v else ""
+    def chain_config_data(self) -> dict:
+        return {"chain_id": self.chain_id} if self.chain_id else {}

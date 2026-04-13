@@ -81,13 +81,12 @@ class CloudFileStorage:
             with attempt:
                 await self.storage_client.delete(self.bucket_name, target_path)
 
-    async def list_files(self, integration_id):
-        # List files without integration_id in the path
-        blobs = await self.storage_client.list_objects(self.bucket_name, params={"prefix": f"{self.root_prefix}"})
+    async def list_files(self, integration_id, sub_prefix: str = ""):
+        prefix = f"{self.root_prefix}/{sub_prefix.strip('/')}" if sub_prefix else self.root_prefix
+        blobs = await self.storage_client.list_objects(self.bucket_name, params={"prefix": prefix})
         for attempt in stamina.retry_context(on=(aiohttp.ClientError, asyncio.TimeoutError),
                                              attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
-                # Return only the blob names without the root_prefix
                 items = blobs.get('items', [])
                 results = [blob['name'].replace(f"{self.root_prefix}/", "") for blob in items if blob['name'].startswith(f"{self.root_prefix}/")]
                 return results
