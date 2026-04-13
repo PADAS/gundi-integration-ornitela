@@ -1,4 +1,5 @@
 from typing import Optional
+from uuid import uuid4
 from .core import ExecutableActionMixin, PullActionConfiguration, InternalActionConfiguration
 import pydantic
 
@@ -27,7 +28,7 @@ class ProcessTelemetryDataActionConfiguration(BucketPathMixin, PullActionConfigu
 
 class CleanupArchiveActionConfiguration(BucketPathMixin, ExecutableActionMixin, PullActionConfiguration):
     bucket_path: str = pydantic.Field("ornitela/", title="Bucket Path", description="Path within the bucket where telemetry files are stored")
-    delete_after_archive_days: int = pydantic.Field(0, title="Delete After Archive Days", description="Number of days after archiving before files are deleted")
+    delete_after_archive_days: int = pydantic.Field(3, title="Delete After Archive Days", description="Number of days after archiving before files are deleted")
 
 
 class ProcessOrnitelaFileActionConfiguration(BucketPathMixin, InternalActionConfiguration):
@@ -40,6 +41,12 @@ class ProcessOrnitelaFileActionConfiguration(BucketPathMixin, InternalActionConf
     historical_limit_days: int = pydantic.Field(5, title="Historical Limit Days", description="Number of days to look back for data")
     batch_size: int = pydantic.Field(500, title="Batch Size", description="Number of observations per batch when sending to Gundi")
     include_sensor_data: bool = pydantic.Field(True, title="Include Sensor Data", description="Include sensor (SEN_*) rows as observations. Disable to send only GPS position data.")
+
+    @pydantic.validator("chain_id", always=True)
+    def ensure_chain_id(cls, v, values):
+        if values.get("source_file") and not v:
+            return str(uuid4())[:8]
+        return v
 
     def chain_config_data(self) -> dict:
         return {"chain_id": self.chain_id} if self.chain_id else {}

@@ -238,7 +238,7 @@ async def _create_chunk(file_storage, integration_id: str, file_name: str, chunk
     csv.writer(chunk_buffer).writerows([header] + chunk_rows)
     chunk_bytes = chunk_buffer.getvalue().encode('utf-8')
 
-    stem = file_name.split('.')[0]
+    stem = os.path.basename(file_name).rsplit('.', 1)[0]
     chunk_name = f"{stem}_{chain_id}_{chunk_index}.csv.gz"
 
     compressed_bytes = gzip.compress(chunk_bytes)
@@ -556,9 +556,9 @@ async def _process_csv_file(file_storage, integration_id: str, file_name: str, i
 
         return telemetry_data
 
-    except asyncio.CancelledError as e:
-        logger.exception(f"GCS connection interrupted while downloading {file_name} — likely a transient network issue")
-        raise OrnitelaFileProcessingError(f"GCS connection interrupted while downloading {file_name}")
+    except asyncio.CancelledError:
+        logger.warning(f"GCS connection interrupted while downloading {file_name} — likely a transient network issue")
+        raise
     except Exception as e:
         if getattr(e, "status", None) == 404:
             raise

@@ -82,11 +82,15 @@ class CloudFileStorage:
                 await self.storage_client.delete(self.bucket_name, target_path)
 
     async def list_files(self, integration_id, sub_prefix: str = ""):
-        prefix = f"{self.root_prefix}/{sub_prefix.strip('/')}" if sub_prefix else self.root_prefix
-        blobs = await self.storage_client.list_objects(self.bucket_name, params={"prefix": prefix})
+        if sub_prefix:
+            clean = sub_prefix.strip("/")
+            prefix = f"{self.root_prefix}/{clean}/" if self.root_prefix else f"{clean}/"
+        else:
+            prefix = f"{self.root_prefix}/" if self.root_prefix else ""
         for attempt in stamina.retry_context(on=(aiohttp.ClientError, asyncio.TimeoutError),
                                              attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
+                blobs = await self.storage_client.list_objects(self.bucket_name, params={"prefix": prefix})
                 items = blobs.get('items', [])
                 results = [blob['name'].replace(f"{self.root_prefix}/", "") for blob in items if blob['name'].startswith(f"{self.root_prefix}/")]
                 return results
