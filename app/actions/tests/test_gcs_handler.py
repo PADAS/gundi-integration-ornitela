@@ -2,10 +2,12 @@ import pytest
 from unittest.mock import Mock, patch, AsyncMock, call
 from datetime import datetime, timedelta, timezone
 
-from app.actions.configurations import ProcessTelemetryDataActionConfiguration, ProcessOrnitelaFileActionConfiguration
+import gzip as gzip_module
+from app.actions.configurations import ProcessTelemetryDataActionConfiguration, ProcessOrnitelaFileActionConfiguration, CleanupArchiveActionConfiguration
 from app.actions.handlers import (
     action_process_new_files,
     action_process_ornitela_file,
+    action_cleanup_archive,
     _process_telemetry_file,
     _process_csv_file,
     _create_chunk,
@@ -40,7 +42,6 @@ def mock_integration():
 def action_config():
     return ProcessTelemetryDataActionConfiguration(
         bucket_path="telemetry-data",
-        delete_after_archive_days=90,
     )
 
 
@@ -49,7 +50,6 @@ def file_action_config():
     return ProcessOrnitelaFileActionConfiguration(
         bucket_path="telemetry-data",
         file_name="bird001_20240101.csv",
-        delete_after_archive_days=90,
     )
 
 
@@ -85,7 +85,9 @@ def make_file_storage_mock(files=None, metadata=None, move_file=None):
             f"GPSS,3,3702,8,,,44.394531250000000,5.370184421539307,"
             f",,,,,,,,,,247,{now.strftime('%Y-%m-%d %H:%M:%S')}.0,0,,,,,\n"
         )
-        return (HEADER + recent_row).encode("utf-8")
+        csv_content = (HEADER + recent_row).encode("utf-8")
+        blob_name = a[1] if len(a) > 1 else ""
+        return gzip_module.compress(csv_content) if blob_name.endswith(".gz") else csv_content
 
     async def default_close(*a, **kw):
         return None
@@ -175,16 +177,13 @@ async def test_process_new_files_skips_in_progress_archive_and_dead_letter_folde
 
 
 @pytest.mark.asyncio
-@patch("app.actions.handlers.FileProcessingLockManager")
-@patch("app.actions.handlers.trigger_action")
 @patch("app.actions.handlers.CloudFileStorage")
-@patch("app.actions.handlers.IntegrationStateManager")
-async def test_process_new_files_deletes_old_archived_files(
-    mock_state_manager, mock_file_storage_cls, mock_trigger_action, mock_lock_manager_cls, mock_integration, action_config
+async def test_action_cleanup_archive_deletes_old_skips_recent(
+    mock_file_storage_cls, mock_integration
 ):
-    """Archived files older than delete_after_archive_days must be deleted."""
-    very_old = datetime.now(timezone.utc) - timedelta(days=95)
-    recent = datetime.now(timezone.utc) - timedelta(days=10)
+    """action_cleanup_archive must delete files older than the threshold and leave recent ones."""
+    very_old = datetime.now(timezone.utc) - timedelta(days=10)
+    recent = datetime.now(timezone.utc) - timedelta(days=1)
 
     async def metadata_by_name(integration_id, file_name):
         if "old" in file_name:
@@ -192,21 +191,22 @@ async def test_process_new_files_deletes_old_archived_files(
         return FileMetadata(timeCreated=recent, updated=recent, size=1024)
 
     storage = make_file_storage_mock(
-        files=["archive/old_file.csv", "archive/recent_file.csv"]
+        files=["archive/old_file.csv.gz", "archive/recent_file.csv.gz"]
     )
     storage.get_file_metadata = Mock(side_effect=metadata_by_name)
     mock_file_storage_cls.return_value = storage
-    mock_trigger_action.side_effect = AsyncMock()
-    mock_state_manager.return_value.get_state = AsyncMock(return_value={})
-    mock_state_manager.return_value.set_state = AsyncMock()
-    mock_lock_manager_cls.return_value.acquire_lock = AsyncMock(return_value=True)
-    mock_lock_manager_cls.return_value.release_lock = AsyncMock(return_value=True)
 
-    result = await action_process_new_files(mock_integration, action_config)
+    cleanup_config = CleanupArchiveActionConfiguration(
+        bucket_path="telemetry-data",
+        delete_after_archive_days=3,
+    )
 
+    result = await action_cleanup_archive(mock_integration, cleanup_config)
+
+    assert result["status"] == "success"
     assert result["files_deleted"] == 1
     storage.delete_file.assert_called_once()
-    assert "old_file.csv" in storage.delete_file.call_args[0][1]
+    assert "old_file" in storage.delete_file.call_args[0][1]
 
 
 @pytest.mark.asyncio
@@ -393,6 +393,23 @@ async def test_process_csv_file_gps_and_sensors():
 
 
 @pytest.mark.asyncio
+async def test_process_csv_file_decompresses_gz():
+    """_process_csv_file must decompress .gz files before parsing."""
+    mock_storage = Mock()
+    compressed = gzip_module.compress((HEADER + GPS_ROW).encode("utf-8"))
+
+    async def mock_download_bytes(*a, **kw):
+        return compressed
+
+    mock_storage.download_bytes = Mock(side_effect=mock_download_bytes)
+
+    result = await _process_csv_file(mock_storage, "test-integration", "test.csv.gz")
+
+    assert len(result) == 1
+    assert result[0]["device_id"] == "226976"
+
+
+@pytest.mark.asyncio
 async def test_process_csv_file_sensor_data_excluded():
     """With include_sensor_data=False, only GPS rows should be returned."""
     mock_storage = Mock()
@@ -454,16 +471,44 @@ async def test_create_chunk_uploads_chunk_and_writes_remaining():
 
     storage.download_bytes = Mock(side_effect=download)
 
-    chunk_name = await _create_chunk(storage, "test-integration", "bird001.csv", chunk_size=3)
+    chunk_name = await _create_chunk(storage, "test-integration", "bird001.csv", chunk_size=3, chain_id="abc12345", chunk_index=1)
 
-    assert chunk_name is not None
-    assert chunk_name.startswith("bird001_chunk_")
+    assert chunk_name == "bird001_abc12345_1.csv.gz"
     # Chunk uploaded to in_progress/
     assert f"in_progress/{chunk_name}" in uploaded
     # Remaining rows written back to root
     assert "bird001.csv" in uploaded
     # Root not deleted (remaining rows exist)
     storage.delete_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_chunk_uploads_gzip_bytes():
+    """_create_chunk must upload gzip-compressed bytes, not raw CSV."""
+    storage = make_file_storage_mock()
+    uploaded = {}
+
+    async def capture_upload(integration_id, blob_name, data, **kw):
+        uploaded[blob_name] = data
+
+    storage.upload_bytes = Mock(side_effect=capture_upload)
+
+    rows = "\n".join(
+        f"226976,TestBird,2025-01-18 09:10:{10+i:02d},2025-01-18,09:10:{10+i:02d},GPSS,3,3702,8,,,44.39,5.37,,,,,,,,,,,247,2025-01-18 09:10:{10+i:02d}.0,0,,,,,"
+        for i in range(2)
+    )
+    csv_bytes = (HEADER.strip() + "\n" + rows).encode("utf-8")
+
+    async def download(*a, **kw):
+        return csv_bytes
+
+    storage.download_bytes = Mock(side_effect=download)
+
+    chunk_name = await _create_chunk(storage, "test-integration", "bird001.csv", chunk_size=3000, chain_id="abc12345", chunk_index=1)
+
+    chunk_bytes = uploaded[f"in_progress/{chunk_name}"]
+    decompressed = gzip_module.decompress(chunk_bytes)
+    assert b"device_id" in decompressed
 
 
 @pytest.mark.asyncio
@@ -489,9 +534,9 @@ async def test_create_chunk_deletes_root_when_final_chunk():
 
     storage.download_bytes = Mock(side_effect=download)
 
-    chunk_name = await _create_chunk(storage, "test-integration", "bird001.csv", chunk_size=3000)
+    chunk_name = await _create_chunk(storage, "test-integration", "bird001.csv", chunk_size=3000, chain_id="abc12345", chunk_index=1)
 
-    assert chunk_name is not None
+    assert chunk_name == "bird001_abc12345_1.csv.gz"
     # Chunk uploaded to in_progress/
     assert f"in_progress/{chunk_name}" in uploaded
     # Root file must be deleted since no remaining rows
@@ -660,10 +705,11 @@ async def test_process_ornitela_file_chains_to_next_chunk(
 
     config = ProcessOrnitelaFileActionConfiguration(
         bucket_path="telemetry-data",
-        file_name="bird001_chunk_20260410_120000.csv",
+        file_name="bird001_abc12345_1.csv.gz",
         source_file="bird001.csv",
+        chain_id="abc12345",
+        chunk_index=1,
         chunk_size=5000,
-        delete_after_archive_days=90,
     )
 
     result = await action_process_ornitela_file(mock_integration, config)
@@ -672,7 +718,8 @@ async def test_process_ornitela_file_chains_to_next_chunk(
     mock_trigger_action.assert_called_once()
     next_config = mock_trigger_action.call_args[1]["config"]
     assert next_config.source_file == "bird001.csv"
-    assert "bird001_chunk_" in next_config.file_name
+    assert next_config.chain_id == "abc12345"
+    assert next_config.chunk_index == 2
 
 
 @pytest.mark.asyncio

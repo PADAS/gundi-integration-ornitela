@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ from app.services.errors import ConfigurationNotFound
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.action_scheduler import crontab_schedule, trigger_action
 from gundi_core.schemas.v2.gundi import LogLevel
-from app.actions.configurations import ProcessTelemetryDataActionConfiguration, ProcessOrnitelaFileActionConfiguration
+from app.actions.configurations import ProcessTelemetryDataActionConfiguration, ProcessOrnitelaFileActionConfiguration, CleanupArchiveActionConfiguration
 from app.services.state import IntegrationStateManager
 from app.services.file_storage import CloudFileStorage
 from app.actions.utils import FileProcessingLockManager
@@ -127,8 +128,7 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
     integration_id = str(integration.id)
     file_storage = None
     in_progress_path = f"in_progress/{action_config.file_name}"
-    chain_id = action_config.chain_id
-    tag = f"[{action_config.file_name}][chain={chain_id}]" if chain_id else f"[{action_config.file_name}]"
+    tag = f"[{action_config.file_name}]"
 
     try:
         file_storage = CloudFileStorage(
@@ -138,7 +138,7 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
 
         logger.info(f"{tag} Starting processing for integration {integration_id}")
 
-        telemetry_data = await _process_csv_file(file_storage, integration_id, in_progress_path, action_config.include_sensor_data)
+        telemetry_data = await _process_csv_file(file_storage, integration_id, in_progress_path, action_config.include_sensor_data, tag=tag, chain_id=action_config.chain_id)
 
         transformed_data = list(generate_gundi_observations(telemetry_data, action_config.historical_limit_days))
         all_batches = list(batches_from_generator(iter(transformed_data), action_config.batch_size))
@@ -163,7 +163,8 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
             integration_id=integration_id,
             action_id="process_ornitela_file",
             title=message,
-            level=LogLevel.INFO
+            level=LogLevel.INFO,
+            config_data=action_config.chain_config_data()
         )
 
         return {
@@ -175,12 +176,13 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
 
     except asyncio.CancelledError:
         logger.error(f"{tag} Timed out — moving to dead_letter/")
-        await _move_to_dead_letter(file_storage, integration_id, in_progress_path, action_config.file_name)
+        await _move_to_dead_letter(file_storage, integration_id, in_progress_path, action_config.file_name, tag=tag)
         await log_action_activity(
             integration_id=integration_id,
             action_id="process_ornitela_file",
             title=f"{tag} Processing exceeded the {settings.MAX_ACTION_EXECUTION_TIME // 60}-minute limit and was sent to the dead letter queue.",
-            level=LogLevel.ERROR
+            level=LogLevel.ERROR,
+            config_data=action_config.chain_config_data()
         )
         raise
     except Exception as e:
@@ -189,13 +191,14 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
             return {"status": "skipped", "file_name": action_config.file_name, "reason": "already_processed"}
         error_detail = str(e) or type(e).__name__
         logger.exception(f"{tag} Error: {error_detail}")
-        await _move_to_dead_letter(file_storage, integration_id, in_progress_path, action_config.file_name)
+        await _move_to_dead_letter(file_storage, integration_id, in_progress_path, action_config.file_name, tag=tag)
         message = f"{tag} Error: {error_detail}"
         await log_action_activity(
             integration_id=str(integration.id),
             action_id="process_ornitela_file",
             title=message,
-            level=LogLevel.ERROR
+            level=LogLevel.ERROR,
+            config_data=action_config.chain_config_data()
         )
         return {
             "status": "error",
@@ -207,7 +210,7 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
             await file_storage.close()
 
 
-async def _create_chunk(file_storage, integration_id: str, file_name: str, chunk_size: int) -> Optional[str]:
+async def _create_chunk(file_storage, integration_id: str, file_name: str, chunk_size: int, chain_id: str, chunk_index: int) -> Optional[str]:
     """
     Download file from root, carve off the first chunk_size data rows, upload the chunk
     to in_progress/, and write the remaining rows back to root (or delete if empty).
@@ -235,12 +238,11 @@ async def _create_chunk(file_storage, integration_id: str, file_name: str, chunk
     csv.writer(chunk_buffer).writerows([header] + chunk_rows)
     chunk_bytes = chunk_buffer.getvalue().encode('utf-8')
 
-    # Unique chunk filename
-    timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-    base_name = file_name.rsplit('.', 1)[0]
-    chunk_name = f"{base_name}_chunk_{timestamp}.csv"
+    stem = os.path.basename(file_name).rsplit('.', 1)[0]
+    chunk_name = f"{stem}_{chain_id}_{chunk_index}.csv.gz"
 
-    await file_storage.upload_bytes(integration_id, f"in_progress/{chunk_name}", chunk_bytes)
+    compressed_bytes = gzip.compress(chunk_bytes)
+    await file_storage.upload_bytes(integration_id, f"in_progress/{chunk_name}", compressed_bytes, content_type='application/gzip')
 
     if remaining_rows:
         remaining_buffer = io.StringIO()
@@ -255,17 +257,18 @@ async def _create_chunk(file_storage, integration_id: str, file_name: str, chunk
     return chunk_name
 
 
-async def _move_to_dead_letter(file_storage, integration_id: str, in_progress_path: str, file_name: str):
+async def _move_to_dead_letter(file_storage, integration_id: str, in_progress_path: str, file_name: str, tag: str = ""):
     """Move a file from in_progress/ to dead_letter/ after a processing failure."""
     if file_storage is None:
         return
-    logger.error(f"Attempting to move {file_name} to dead_letter/")
+    prefix = f"{tag} " if tag else ""
+    logger.error(f"{prefix}Attempting to move {file_name} to dead_letter/")
     try:
         dead_letter_path = f"dead_letter/{file_name}"
         await file_storage.move_file(integration_id, in_progress_path, dead_letter_path)
-        logger.error(f"Successfully moved {file_name} to dead_letter/")
+        logger.error(f"{prefix}Successfully moved {file_name} to dead_letter/")
     except Exception:
-        logger.exception(f"Could not move {file_name} to dead_letter/ — file remains in in_progress/")
+        logger.exception(f"{prefix}Could not move {file_name} to dead_letter/ — file remains in in_progress/")
 
 
 
@@ -276,19 +279,21 @@ async def _trigger_next_chunk(file_storage, integration_id: str, action_config: 
     If the source file is locked (cron beat us to it) or exhausted, exits silently.
     """
     source_file = action_config.source_file
+    tag = f"[{source_file}]"
     lock_manager = FileProcessingLockManager()
 
     acquired = await lock_manager.acquire_lock(integration_id, source_file)
     if not acquired:
-        logger.info(f"Source file {source_file} is locked — cron will handle the next chunk")
+        logger.info(f"{tag} Source file is locked — cron will handle the next chunk")
         return
 
     try:
+        next_index = action_config.chunk_index + 1
         chunk_name = await _create_chunk(
-            file_storage, integration_id, source_file, action_config.chunk_size
+            file_storage, integration_id, source_file, action_config.chunk_size, action_config.chain_id, next_index
         )
         if chunk_name is None:
-            logger.info(f"Source file {source_file} exhausted, chain complete")
+            logger.info(f"{tag} Source file exhausted, chain complete")
             return
 
         config = ProcessOrnitelaFileActionConfiguration(
@@ -296,9 +301,9 @@ async def _trigger_next_chunk(file_storage, integration_id: str, action_config: 
             file_name=chunk_name,
             source_file=source_file,
             chain_id=action_config.chain_id,
+            chunk_index=next_index,
             chunk_size=action_config.chunk_size,
             historical_limit_days=action_config.historical_limit_days,
-            delete_after_archive_days=action_config.delete_after_archive_days,
             batch_size=action_config.batch_size,
             include_sensor_data=action_config.include_sensor_data,
         )
@@ -307,12 +312,12 @@ async def _trigger_next_chunk(file_storage, integration_id: str, action_config: 
             action_id="process_ornitela_file",
             config=config,
         )
-        logger.info(f"Next chunk triggered for {source_file}: {chunk_name}")
+        logger.info(f"{tag} Next chunk triggered: {chunk_name}")
     except Exception as e:
         if getattr(e, "status", None) == 404:
-            logger.info(f"Source file {source_file} no longer exists — chain complete")
+            logger.info(f"{tag} Source file no longer exists — chain complete")
         else:
-            logger.exception(f"Error triggering next chunk for {source_file}: {str(e)}")
+            logger.exception(f"{tag} Error triggering next chunk: {str(e)}")
     finally:
         await lock_manager.release_lock(integration_id, source_file)
 
@@ -345,7 +350,6 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
         file_list = await file_storage.list_files(integration_id)
 
         new_files = []
-        archived_files_to_delete = []
         current_time = datetime.now(timezone.utc)
 
         for file_name in file_list:
@@ -355,18 +359,6 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
 
             # Skip files already in progress, archived, or in dead_letter — only process root files
             if file_name.startswith("in_progress/") or file_name.startswith("archive/") or file_name.startswith("dead_letter/"):
-                # Check archived files for deletion
-                if file_name.startswith("archive/"):
-                    try:
-                        metadata = await file_storage.get_file_metadata(integration_id, file_name)
-                        file_created = metadata.timeCreated or current_time
-                        if file_created.tzinfo is None:
-                            file_created = file_created.replace(tzinfo=timezone.utc)
-                        days_since_created = (current_time - file_created).days
-                        if days_since_created >= action_config.delete_after_archive_days:
-                            archived_files_to_delete.append(file_name)
-                    except Exception as e:
-                        logger.warning(f"Could not get metadata for archived file {file_name}: {str(e)}")
                 continue
 
             # Get file metadata
@@ -402,8 +394,9 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
                 logger.info(f"File {file_name} is locked by another process, skipping")
                 continue
             try:
+                chain_id = str(uuid4())[:8]
                 chunk_name = await _create_chunk(
-                    file_storage, integration_id, file_name, action_config.chunk_size
+                    file_storage, integration_id, file_name, action_config.chunk_size, chain_id, 1
                 )
                 if chunk_name is None:
                     continue
@@ -412,10 +405,10 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
                     bucket_path=action_config.bucket_path,
                     file_name=chunk_name,
                     source_file=file_name,
-                    chain_id=str(uuid4())[:8],
+                    chain_id=chain_id,
+                    chunk_index=1,
                     chunk_size=action_config.chunk_size,
                     historical_limit_days=action_config.historical_limit_days,
-                    delete_after_archive_days=action_config.delete_after_archive_days,
                     batch_size=action_config.batch_size,
                     include_sensor_data=action_config.include_sensor_data,
                 )
@@ -432,16 +425,6 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
             finally:
                 await lock_manager.release_lock(integration_id, file_name)
 
-        # Delete old archived files
-        deleted_count = 0
-        for file_name in archived_files_to_delete:
-            try:
-                await file_storage.delete_file(integration_id, file_name)
-                deleted_count += 1
-                logger.info(f"Deleted old archived file: {file_name}")
-            except Exception as e:
-                logger.error(f"Error deleting archived file {file_name}: {str(e)}")
-
         # Update state
         await state_manager.set_state(
             integration_id,
@@ -449,7 +432,6 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
             {
                 "last_run": current_time.isoformat(),
                 "last_subactions_triggered": subactions_triggered,
-                "last_deleted_count": deleted_count,
             }
         )
 
@@ -457,7 +439,6 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
             "status": "success",
             "new_files_found": len(new_files),
             "subactions_triggered": subactions_triggered,
-            "files_deleted": deleted_count,
         }
         
     except Exception as e:
@@ -471,7 +452,61 @@ async def action_process_new_files(integration, action_config: ProcessTelemetryD
             await file_storage.close()
 
 
-async def _process_csv_file(file_storage, integration_id: str, file_name: str, include_sensor_data: bool = True) -> List[Dict[str, Any]]:
+@crontab_schedule("0 0 * * *")  # Once a day at midnight.
+@activity_logger()
+async def action_cleanup_archive(integration, action_config: CleanupArchiveActionConfiguration):
+    """
+    Deletes archived files that have been in the archive/ folder longer than delete_after_archive_days.
+    Runs once a day to avoid adding overhead to the main file discovery loop.
+    """
+    integration_id = str(integration.id)
+    file_storage = None
+
+    try:
+        file_storage = CloudFileStorage(
+            bucket_name=settings.INFILE_STORAGE_BUCKET,
+            root_prefix=action_config.bucket_path
+        )
+
+        file_list = await file_storage.list_files(integration_id, sub_prefix="archive/")
+        current_time = datetime.now(timezone.utc)
+
+        async def maybe_delete(file_name: str) -> int:
+            if file_name.endswith("/"):
+                return 0
+            try:
+                metadata = await file_storage.get_file_metadata(integration_id, file_name)
+                file_created = metadata.timeCreated or current_time
+                if file_created.tzinfo is None:
+                    file_created = file_created.replace(tzinfo=timezone.utc)
+                if (current_time - file_created).days >= action_config.delete_after_archive_days:
+                    await file_storage.delete_file(integration_id, file_name)
+                    logger.info(f"Deleted old archived file: {file_name}")
+                    return 1
+            except Exception as e:
+                logger.warning(f"Could not process archived file {file_name}: {str(e)}")
+            return 0
+
+        results = await asyncio.gather(*[maybe_delete(f) for f in file_list])
+        deleted_count = sum(results)
+
+        return {
+            "status": "success",
+            "files_deleted": deleted_count,
+        }
+
+    except Exception as e:
+        logger.exception(f"Error in action_cleanup_archive: {str(e)}")
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+    finally:
+        if file_storage:
+            await file_storage.close()
+
+
+async def _process_csv_file(file_storage, integration_id: str, file_name: str, include_sensor_data: bool = True, tag: str = "", chain_id: str = None) -> List[Dict[str, Any]]:
     """
     Process CSV telemetry data. Downloads the full file into memory, then parses it.
     Each GPS row becomes one observation with its real location.
@@ -481,6 +516,8 @@ async def _process_csv_file(file_storage, integration_id: str, file_name: str, i
 
     try:
         raw_bytes = await file_storage.download_bytes(integration_id, file_name)
+        if file_name.endswith('.gz'):
+            raw_bytes = gzip.decompress(raw_bytes)
         encoding = _detect_encoding(raw_bytes)
         logger.debug(f"Detected encoding '{encoding}' for file {file_name}")
 
@@ -492,12 +529,14 @@ async def _process_csv_file(file_storage, integration_id: str, file_name: str, i
         reader = csv.DictReader(io.StringIO(content))
         rows = list(reader)
         row_count = len(rows)
-        logger.info(f"Processing {file_name}: {row_count} rows")
+        prefix = f"{tag} " if tag else ""
+        logger.info(f"{prefix}Processing {file_name}: {row_count} rows")
         await log_action_activity(
             integration_id=integration_id,
             action_id="process_ornitela_file",
             title=f"File {file_name}: {row_count} rows",
-            level=LogLevel.INFO
+            level=LogLevel.INFO,
+            config_data={"chain_id": chain_id} if chain_id else {}
         )
 
         for row_data in rows:
@@ -517,11 +556,15 @@ async def _process_csv_file(file_storage, integration_id: str, file_name: str, i
 
         return telemetry_data
 
+    except asyncio.CancelledError:
+        logger.warning(f"GCS connection interrupted while downloading {file_name} — likely a transient network issue")
+        raise
     except Exception as e:
         if getattr(e, "status", None) == 404:
             raise
-        logger.exception(f"Error processing CSV file {file_name}: {str(e)}")
-        raise OrnitelaFileProcessingError(f"Error processing CSV file {file_name}: {str(e)}")
+        error_str = str(e) or type(e).__name__
+        logger.exception(f"Error processing CSV file {file_name}: {error_str}")
+        raise OrnitelaFileProcessingError(f"Error processing CSV file {file_name}: {error_str}")
         
 
 
