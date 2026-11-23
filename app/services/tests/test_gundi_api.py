@@ -1,6 +1,6 @@
 import anyio
 import pytest
-from app.services.gundi import send_events_to_gundi, send_observations_to_gundi, send_event_attachments_to_gundi
+from app.services.gundi import send_events_to_gundi, send_observations_to_gundi, send_event_attachments_to_gundi, _get_gundi_api_key
 
 
 @pytest.mark.asyncio
@@ -156,3 +156,19 @@ async def test_send_observations_to_gundi_does_not_retry_other_errors(mocker, in
         )
 
     assert sensors_api_client.post_observations.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_gundi_api_key_retries_connection_closed_during_tls_handshake(mocker, integration_v2):
+    mocker.patch("asyncio.sleep", new_callable=mocker.AsyncMock)
+    gundi_client = mocker.MagicMock()
+    gundi_client.get_integration_api_key = mocker.AsyncMock(side_effect=[anyio.EndOfStream(), "test-api-key"])
+    gundi_client_class = mocker.MagicMock()
+    gundi_client_class.return_value.__aenter__ = mocker.AsyncMock(return_value=gundi_client)
+    gundi_client_class.return_value.__aexit__ = mocker.AsyncMock(return_value=False)
+    mocker.patch("app.services.gundi.GundiClient", gundi_client_class)
+
+    api_key = await _get_gundi_api_key(integration_id=str(integration_v2.id))
+
+    assert api_key == "test-api-key"
+    assert gundi_client.get_integration_api_key.await_count == 2
