@@ -1,4 +1,5 @@
 import anyio
+import httpx
 import pytest
 from app.services.gundi import send_events_to_gundi, send_observations_to_gundi, send_event_attachments_to_gundi, _get_gundi_api_key
 
@@ -172,3 +173,39 @@ async def test_get_gundi_api_key_retries_connection_closed_during_tls_handshake(
 
     assert api_key == "test-api-key"
     assert gundi_client.get_integration_api_key.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_send_observations_to_gundi_keeps_http_error_retry_after_slow_tls_handshake_drops(mocker, integration_v2):
+    # Controlled clock: only tenacity's budget clock and the retry sleeps move, so no real waiting
+    clock = {"now": 1000.0}
+    mocker.patch("tenacity.time", mocker.MagicMock(monotonic=lambda: clock["now"]))
+
+    async def fake_sleep(seconds, *args, **kwargs):
+        clock["now"] += seconds
+
+    mocker.patch("asyncio.sleep", fake_sleep)
+
+    # Three handshake drops that each hang 20 s (more than stamina's 45 s default budget in total),
+    # then one HTTP error, then success
+    outcomes = [anyio.EndOfStream(), anyio.EndOfStream(), anyio.EndOfStream(), httpx.ConnectTimeout("timed out"), [{"object_id": "1"}]]
+
+    async def post_observations(data):
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, anyio.EndOfStream):
+            clock["now"] += 20.0
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    sensors_api_client = mocker.MagicMock()
+    sensors_api_client.post_observations = mocker.AsyncMock(side_effect=post_observations)
+
+    response = await send_observations_to_gundi(
+        observations=[{"source": "device-xy123"}],
+        sensors_api_client=sensors_api_client,
+        integration_id=integration_v2.id
+    )
+
+    assert response == [{"object_id": "1"}]
+    assert sensors_api_client.post_observations.await_count == 5

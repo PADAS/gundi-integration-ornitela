@@ -11,13 +11,15 @@ from gundi_client_v2.client import GundiClient, GundiDataSenderClient
 # It happens before the request is sent, so retrying it can't duplicate data.
 # A failed handshake can hang ~20 s, so it gets a longer budget than stamina's
 # 45 s default; other HTTP errors keep their existing retry unchanged.
+# Apply it above the httpx.HTTPError retry: the inner retry starts a fresh
+# 45 s budget on every call, so time spent on handshake drops never uses it up.
 retry_tls_handshake_drop = stamina.retry(
     on=anyio.EndOfStream, wait_initial=10.0, wait_jitter=10.0, wait_max=60.0, timeout=120.0
 )
 
 
-@stamina.retry(on=httpx.HTTPError, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
 @retry_tls_handshake_drop
+@stamina.retry(on=httpx.HTTPError, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
 async def _get_gundi_api_key(integration_id):
     async with GundiClient() as gundi_client:
         return await gundi_client.get_integration_api_key(
@@ -81,8 +83,8 @@ async def send_event_attachments_to_gundi(event_id: str, attachments: List[tuple
     return await sensors_api_client.post_event_attachments(event_id=event_id, attachments=attachments)
 
 
-@stamina.retry(on=httpx.HTTPError, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
 @retry_tls_handshake_drop
+@stamina.retry(on=httpx.HTTPError, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
 async def send_observations_to_gundi(observations: List[dict], sensors_api_client=None, **kwargs) -> dict:
     """
     Send Observations to Gundi using the REST API v2
