@@ -1,8 +1,14 @@
 import datetime
 from typing import List
+import anyio
 import httpx
 import stamina
 from gundi_client_v2.client import GundiClient, GundiDataSenderClient
+
+# httpcore 0.17 raises a connection closed during the TLS handshake as a bare
+# anyio.EndOfStream instead of an httpx error, so retry it explicitly.
+# (httpcore >= 1.0.5 maps it to httpx.ConnectError.)
+SEND_RETRY_ERRORS = (httpx.HTTPError, anyio.EndOfStream)
 
 
 @stamina.retry(on=httpx.HTTPError, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
@@ -69,7 +75,7 @@ async def send_event_attachments_to_gundi(event_id: str, attachments: List[tuple
     return await sensors_api_client.post_event_attachments(event_id=event_id, attachments=attachments)
 
 
-@stamina.retry(on=httpx.HTTPError, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
+@stamina.retry(on=SEND_RETRY_ERRORS, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
 async def send_observations_to_gundi(observations: List[dict], sensors_api_client=None, **kwargs) -> dict:
     """
     Send Observations to Gundi using the REST API v2

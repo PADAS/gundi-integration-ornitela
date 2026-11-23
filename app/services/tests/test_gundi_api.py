@@ -1,3 +1,4 @@
+import anyio
 import pytest
 from app.services.gundi import send_events_to_gundi, send_observations_to_gundi, send_event_attachments_to_gundi
 
@@ -121,3 +122,37 @@ async def test_send_observations_to_gundi(
     assert len(response) == 2
     assert mock_gundi_sensors_client_class.called
     mock_gundi_sensors_client_class.return_value.post_observations.assert_called_once_with(data=observations)
+
+
+@pytest.mark.asyncio
+async def test_send_observations_to_gundi_retries_connection_closed_during_tls_handshake(mocker, integration_v2):
+    # httpcore 0.17 raises a bare anyio.EndOfStream when the connection closes during the TLS handshake
+    mocker.patch("asyncio.sleep", new_callable=mocker.AsyncMock)  # skip the wait between retries
+    sensors_api_client = mocker.MagicMock()
+    sensors_api_client.post_observations = mocker.AsyncMock(side_effect=[anyio.EndOfStream(), [{"object_id": "1"}]])
+    observations = [{"source": "device-xy123", "recorded_at": "2024-01-24 09:03:00-0300", "location": {"lat": -51.7, "lon": -72.7}}]
+
+    response = await send_observations_to_gundi(
+        observations=observations,
+        sensors_api_client=sensors_api_client,
+        integration_id=integration_v2.id
+    )
+
+    assert response == [{"object_id": "1"}]
+    assert sensors_api_client.post_observations.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_send_observations_to_gundi_does_not_retry_other_errors(mocker, integration_v2):
+    mocker.patch("asyncio.sleep", new_callable=mocker.AsyncMock)
+    sensors_api_client = mocker.MagicMock()
+    sensors_api_client.post_observations = mocker.AsyncMock(side_effect=ValueError("bad data"))
+
+    with pytest.raises(ValueError):
+        await send_observations_to_gundi(
+            observations=[{"source": "device-xy123"}],
+            sensors_api_client=sensors_api_client,
+            integration_id=integration_v2.id
+        )
+
+    assert sensors_api_client.post_observations.await_count == 1
