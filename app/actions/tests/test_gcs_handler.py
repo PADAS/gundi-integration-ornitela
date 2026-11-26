@@ -3,6 +3,8 @@ from unittest.mock import Mock, patch, AsyncMock, call
 from datetime import datetime, timedelta, timezone
 
 import gzip as gzip_module
+import httpx
+import stamina
 from app.actions.configurations import ProcessTelemetryDataActionConfiguration, ProcessOrnitelaFileActionConfiguration, CleanupArchiveActionConfiguration
 from app.actions.handlers import (
     action_process_new_files,
@@ -357,6 +359,78 @@ async def test_process_ornitela_file_storage_init_error_no_dead_letter_move(
 
     assert result["status"] == "error"
     assert "storage unavailable" in result["error"]
+
+
+@pytest.fixture
+def stamina_two_attempts():
+    """Retry without waiting, capped at two attempts, so retry paths run instantly."""
+    stamina.set_testing(True, attempts=2)
+    yield
+    stamina.set_testing(False)
+
+
+@pytest.mark.asyncio
+@patch("app.actions.handlers._get_sensors_api_client", new_callable=AsyncMock)
+@patch("app.actions.handlers.send_observations_to_gundi")
+@patch("app.actions.handlers.CloudFileStorage")
+async def test_process_ornitela_file_retries_client_acquisition_then_archives(
+    mock_file_storage_cls, mock_send, mock_get_client, mock_integration, stamina_two_attempts
+):
+    """A transient error while fetching the API key is retried; the chunk is then archived
+    and the one client acquired is reused for every batch."""
+    now = datetime.now(timezone.utc)
+    rows = "\n".join(
+        f"226976,TestBird,{now.strftime('%Y-%m-%d %H:%M:%S')},{now.strftime('%Y-%m-%d')},{now.strftime('%H:%M:%S')},GPSS,3,3702,8,,,44.39,5.37,,,,,,,,,,,247,{now.strftime('%Y-%m-%d %H:%M:%S')}.0,0,,,,,"
+        for _ in range(3)
+    )
+    csv_bytes = (HEADER.strip() + "\n" + rows).encode("utf-8")
+    storage = make_file_storage_mock()
+
+    async def download(*a, **kw):
+        return csv_bytes
+
+    storage.download_bytes = Mock(side_effect=download)
+    mock_file_storage_cls.return_value = storage
+    mock_send.return_value = None
+    client = Mock(name="sensors_client")
+    mock_get_client.side_effect = [httpx.ConnectError("handshake dropped"), client]
+
+    config = ProcessOrnitelaFileActionConfiguration(
+        bucket_path="telemetry-data",
+        file_name="bird001_20240101.csv",
+        batch_size=1,
+    )
+    result = await action_process_ornitela_file(mock_integration, config)
+
+    assert result["status"] == "success"
+    assert mock_get_client.await_count == 2
+    assert mock_send.call_count == 3
+    assert all(c.kwargs["sensors_api_client"] is client for c in mock_send.call_args_list)
+    moves = [c.args[2] for c in storage.move_file.call_args_list]
+    assert moves == ["archive/bird001_20240101.csv"]
+
+
+@pytest.mark.asyncio
+@patch("app.actions.handlers._get_sensors_api_client", new_callable=AsyncMock)
+@patch("app.actions.handlers.send_observations_to_gundi")
+@patch("app.actions.handlers.CloudFileStorage")
+async def test_process_ornitela_file_exhausted_client_acquisition_dead_letters(
+    mock_file_storage_cls, mock_send, mock_get_client, mock_integration, file_action_config,
+    stamina_two_attempts
+):
+    """When every attempt to fetch the API key fails, nothing is sent and the chunk
+    goes to dead_letter/."""
+    storage = make_file_storage_mock()
+    mock_file_storage_cls.return_value = storage
+    mock_get_client.side_effect = httpx.ConnectError("handshake dropped")
+
+    result = await action_process_ornitela_file(mock_integration, file_action_config)
+
+    assert result["status"] == "error"
+    assert mock_get_client.await_count == 2
+    mock_send.assert_not_called()
+    moves = [c.args[2] for c in storage.move_file.call_args_list]
+    assert moves == ["dead_letter/bird001_20240101.csv"]
 
 
 # ---------------------------------------------------------------------------
