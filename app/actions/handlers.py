@@ -8,7 +8,8 @@ import io
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, AsyncGenerator, Generator, Optional
 from uuid import uuid4
-from app.services.gundi import send_observations_to_gundi, _get_sensors_api_client
+import stamina
+from app.services.gundi import send_observations_to_gundi, _get_sensors_api_client, GUNDI_API_RETRY
 from app.services.utils import batches_from_generator, find_config_for_action
 from app.services.errors import ConfigurationNotFound
 from app.services.activity_logger import activity_logger, log_action_activity
@@ -143,7 +144,9 @@ async def action_process_ornitela_file(integration, action_config: ProcessOrnite
         transformed_data = list(generate_gundi_observations(telemetry_data, action_config.historical_limit_days))
         all_batches = list(batches_from_generator(iter(transformed_data), action_config.batch_size))
         observations_sent = 0
-        sensors_client = await _get_sensors_api_client(integration_id=str(integration.id))
+        # The template's _get_gundi_api_key has no retry of its own (the send helpers
+        # retry around it), so the key fetched once per chunk gets the same policy here.
+        sensors_client = await stamina.retry(**GUNDI_API_RETRY)(_get_sensors_api_client)(integration_id=str(integration.id))
 
         for batch in all_batches:
             await send_observations_to_gundi(observations=batch, sensors_api_client=sensors_client, integration_id=integration.id)

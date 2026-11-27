@@ -1,4 +1,5 @@
-# Add your integration-specific dependencies here
+# Add your integration-specific runtime dependencies here. They compile into
+# requirements.txt, which the production image installs. Test-only dependencies
+# (respx, pytest plugins, ...) go in requirements-test.in instead.
 google-auth>=2.23.0
 gcloud-aio-storage==9.3.0
-httpx==0.24.1
